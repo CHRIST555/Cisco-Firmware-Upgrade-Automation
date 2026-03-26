@@ -1,0 +1,114 @@
+# =============================================================================
+# pre_upgrade_checks.yml
+# Purpose : Validate every device in upgrade_candidates is ready for a firmware
+#           upgrade before any files are transferred or reboots are triggered.
+# Outputs : - backups/pre-upgrade/<hostname>_<version>.cfg   (config backup)
+#           - reports/pre-upgrade/<hostname>.yml              (state snapshot)
+# Run order: 1 of 4  →  stage_firmware → execute_upgrade → post_upgrade_verify
+# =============================================================================
+---
+- name: Pre-upgrade validation
+  hosts: upgrade_candidates
+  gather_facts: false      # IOS devices don't support Ansible fact gathering
+  connection: network_cli
+  serial: 1                # Check one device at a time — fail fast, fail safe
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 1. Version check — skip devices already on the target release
+    # -------------------------------------------------------------------------
+    - name: Get current IOS-XE version
+      cisco.ios.ios_command:
+        commands:
+          - show version
+      register: version_output
+
+    # regex_search returns a list of capture groups; | first extracts the string
+    - name: Parse version string from 'show version' output
+      ansible.builtin.set_fact:
+        current_version: "{{ version_output.stdout[0] | regex_search('Version ([\\S]+)', '\\1') | first }}"
+
+    - name: Inform operator if device is already on target version
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} is already running {{ current_version }} — skipping."
+      when: current_version == firmware.target_version
+
+    # end_host skips remaining tasks for this host only; the play continues for others
+    - name: Skip host if already on target version
+      ansible.builtin.meta: end_host
+      when: current_version == firmware.target_version
+
+    # -------------------------------------------------------------------------
+    # 2. Flash space check — ensure the image fits with headroom
+    # -------------------------------------------------------------------------
+    - name: Check free flash space
+      cisco.ios.ios_command:
+        commands:
+          - dir flash: | include free    # IOS pipe filter — returns one line with free bytes
+      register: flash_info
+
+    - name: Parse free flash bytes
+      ansible.builtin.set_fact:
+        free_space: "{{ flash_info.stdout[0] | regex_search('(\\d+) bytes free', '\\1') | first }}"
+
+    - name: Assert sufficient flash space is available
+      ansible.builtin.assert:
+        that:
+          - free_space | int > firmware.min_flash_space
+        fail_msg: >
+          PREFLIGHT FAILED on {{ inventory_hostname }}:
+          only {{ free_space | int | filesizeformat }} free,
+          need {{ firmware.min_flash_space | int | filesizeformat }}.
+          Remove old images with 'del flash:<old_image>' and retry.
+        success_msg: "Flash OK on {{ inventory_hostname }}: {{ free_space | int | filesizeformat }} free."
+
+    # -------------------------------------------------------------------------
+    # 3. CPU health check — do not upgrade a device under heavy load
+    # -------------------------------------------------------------------------
+    - name: Sample CPU utilisation
+      cisco.ios.ios_command:
+        commands:
+          - show processes cpu | include CPU    # Returns a summary line, not per-process detail
+      register: cpu_info
+
+    # The 5-minute average is the most reliable indicator of sustained load
+    - name: Parse 5-minute CPU average
+      ansible.builtin.set_fact:
+        cpu_usage: "{{ cpu_info.stdout[0] | regex_search('five minutes: (\\d+)', '\\1') | first }}"
+
+    - name: Assert CPU usage is within safe threshold
+      ansible.builtin.assert:
+        that:
+          - cpu_usage | int < firmware.cpu_threshold
+        fail_msg: >
+          PREFLIGHT FAILED on {{ inventory_hostname }}:
+          CPU at {{ cpu_usage }}% (threshold {{ firmware.cpu_threshold }}%).
+          Investigate high CPU before upgrading.
+        success_msg: "CPU OK on {{ inventory_hostname }}: {{ cpu_usage }}% (threshold {{ firmware.cpu_threshold }}%)."
+
+    # -------------------------------------------------------------------------
+    # 4. Configuration backup — safety net in case rollback is needed
+    # -------------------------------------------------------------------------
+    # ios_config backup: true triggers a full running-config pull saved locally
+    - name: Back up running configuration
+      cisco.ios.ios_config:
+        backup: true
+        backup_options:
+          dir_path: "backups/pre-upgrade"
+          filename: "{{ inventory_hostname }}_{{ current_version }}.cfg"
+
+    # -------------------------------------------------------------------------
+    # 5. Pre-upgrade state snapshot — written to disk for post-upgrade comparison
+    # -------------------------------------------------------------------------
+    - name: Write pre-upgrade state snapshot
+      ansible.builtin.copy:
+        content: |
+          hostname:        {{ inventory_hostname }}
+          current_version: {{ current_version }}
+          target_version:  {{ firmware.target_version }}
+          free_space_b:    {{ free_space }}
+          cpu_5min_pct:    {{ cpu_usage }}
+          timestamp:       {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}
+        dest: "reports/pre-upgrade/{{ inventory_hostname }}.yml"
+      delegate_to: localhost    # File is written on the Ansible control node, not the router

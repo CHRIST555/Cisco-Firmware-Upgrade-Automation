@@ -1,0 +1,108 @@
+# =============================================================================
+# execute_upgrade.yml
+# Purpose : Set the boot variable to the new image, save configuration, and
+#           reload the device. Then wait for it to come back online.
+# Run order: 3 of 4  →  pre_upgrade_checks → stage_firmware → [HERE] → post_upgrade_verify
+# WARNING : This playbook causes a network outage on each device it targets.
+#           Always run with serial: 1 (one device at a time) and during a
+#           scheduled maintenance window.
+# =============================================================================
+---
+- name: Execute firmware upgrade
+  hosts: upgrade_candidates
+  gather_facts: false
+  connection: network_cli
+  serial: 1    # CRITICAL: reload one device at a time to limit blast radius
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 1. Set boot variable
+    #    'no boot system' clears any existing boot statements first, ensuring
+    #    only the new image is booted. save_when: always writes to NVRAM.
+    # -------------------------------------------------------------------------
+    - name: Set boot variable to new firmware image
+      cisco.ios.ios_config:
+        lines:
+          - "no boot system"                                      # Remove all existing boot statements
+          - "boot system flash:{{ firmware.target_image }}"       # Set new image as sole boot target
+        save_when: always    # Immediately writes startup-config — equivalent to 'write memory'
+
+    # -------------------------------------------------------------------------
+    # 2. Verify boot variable was accepted
+    #    'show boot' output must contain the target image filename.
+    #    If this assert fails, the reload is not attempted.
+    # -------------------------------------------------------------------------
+    - name: Confirm boot variable with 'show boot'
+      cisco.ios.ios_command:
+        commands:
+          - show boot
+      register: boot_check
+
+    - name: Assert boot variable contains target image
+      ansible.builtin.assert:
+        that:
+          - firmware.target_image in boot_check.stdout[0]
+        fail_msg: >
+          Boot variable NOT set correctly on {{ inventory_hostname }}.
+          Aborting reload — check 'show boot' manually.
+        success_msg: "Boot variable confirmed on {{ inventory_hostname }}."
+
+    # -------------------------------------------------------------------------
+    # 3. Final config save before reload
+    #    ios_config with save_when: always already saved, but an explicit
+    #    'write memory' here is a belt-and-suspenders safety measure.
+    # -------------------------------------------------------------------------
+    - name: Save running configuration (belt-and-suspenders before reload)
+      cisco.ios.ios_command:
+        commands:
+          - write memory
+
+    # -------------------------------------------------------------------------
+    # 4. Reload the device
+    #    IOS may prompt "Save configuration? [yes/no]" and "Proceed with reload?"
+    #    Both prompts are answered 'y'. ignore_errors: true is required because
+    #    the SSH connection will drop as soon as the device begins reloading —
+    #    that disconnect looks like a task failure to Ansible.
+    # -------------------------------------------------------------------------
+    - name: Reload device to boot new firmware
+      cisco.ios.ios_command:
+        commands:
+          - command: reload
+            prompt:
+              - "Save"       # "Save configuration? [yes/no]:"
+              - "confirm"    # "Proceed with reload? [confirm]"
+            answer:
+              - "y"
+              - "y"
+      vars:
+        ansible_command_timeout: 30    # Short timeout — connection drops immediately on reload
+      ignore_errors: true              # Expected: SSH session is terminated by the reload
+
+    # -------------------------------------------------------------------------
+    # 5. Wait for SSH to become available (device is rebooting)
+    #    delay: 120 gives the device time to start shutting down before we poll.
+    #    timeout: 600 allows up to 10 minutes for the full boot cycle.
+    #    Adjust timeout upward for chassis with many line cards.
+    # -------------------------------------------------------------------------
+    - name: Wait for device SSH port to reopen after reboot
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        delay: 120      # Seconds to wait before first poll (device is still shutting down)
+        timeout: 600    # Maximum seconds to wait for SSH to come back (10 minutes)
+        state: started
+      delegate_to: localhost    # The wait loop runs on the control node, not the router
+
+    # -------------------------------------------------------------------------
+    # 6. Extra stabilisation pause
+    #    SSH becomes available before IOS fully initialises all processes,
+    #    routing protocols, and interfaces. This pause reduces false failures
+    #    in the post-upgrade verification playbook.
+    # -------------------------------------------------------------------------
+    - name: Allow device services and routing protocols to stabilise
+      ansible.builtin.pause:
+        seconds: 60
+        prompt: >
+          Waiting 60 s for {{ inventory_hostname }} to fully initialise
+          after reboot. Press Ctrl+C then A to abort if needed.

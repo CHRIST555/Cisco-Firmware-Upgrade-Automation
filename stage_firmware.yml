@@ -1,0 +1,82 @@
+# =============================================================================
+# stage_firmware.yml
+# Purpose : Copy the target firmware image to each device's flash memory and
+#           verify integrity with MD5. No configuration changes are made here.
+# Outputs : firmware image written to flash: on each device
+# Run order: 2 of 4  →  pre_upgrade_checks → [HERE] → execute_upgrade → post_upgrade_verify
+# Note    : serial: 5 allows parallel staging to save time. Reduce to 1 or 2
+#           if the file server or WAN links cannot handle concurrent SCP sessions.
+# =============================================================================
+---
+- name: Stage firmware images
+  hosts: upgrade_candidates
+  gather_facts: false
+  connection: network_cli
+  serial: 5    # Transfer to up to 5 devices simultaneously
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 1. Idempotency check — skip the transfer if the image is already present
+    #    'dir flash:<file>' exits non-zero if the file doesn't exist, so we
+    #    ignore_errors and branch on the result.
+    # -------------------------------------------------------------------------
+    - name: Check whether target image already exists on flash
+      cisco.ios.ios_command:
+        commands:
+          - "dir flash:{{ firmware.target_image }}"
+      register: image_check
+      ignore_errors: true    # Task will 'fail' if file is absent — that is expected
+
+    - name: Inform operator that transfer will be skipped (image already present)
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ firmware.target_image }} already on flash — skipping SCP transfer."
+      when: image_check is succeeded
+
+    # -------------------------------------------------------------------------
+    # 2. SCP transfer — only runs when the image is absent
+    #    ansible_command_timeout is extended to 30 min (1800 s) because large
+    #    images over slow WAN links can take a long time.
+    #    IMPORTANT: The SCP password is embedded in the IOS command string.
+    #               Ensure this play is run with Ansible Vault and that
+    #               no_log: true is set if output logging is enabled centrally.
+    # -------------------------------------------------------------------------
+    - name: Copy firmware image via SCP to device flash
+      cisco.ios.ios_command:
+        commands:
+          - command: >
+              copy scp://{{ firmware.file_server_user }}:{{ firmware.file_server_password }}@{{ firmware.file_server }}{{ firmware.file_server_path }}/{{ firmware.target_image }}
+              flash:{{ firmware.target_image }}
+            prompt:
+              - "Destination filename"    # IOS prompts for confirmation of destination name
+            answer:
+              - ""                        # Accept the default (same filename)
+        wait_for:
+          - result[0] contains "bytes copied"    # Fail the task if this string never appears
+      when: image_check is failed
+      vars:
+        ansible_command_timeout: 1800    # 30-minute timeout for large image transfers
+      no_log: true                       # Prevent the SCP URL (with password) from appearing in logs
+
+    # -------------------------------------------------------------------------
+    # 3. MD5 verification — confirms the image was not corrupted in transit
+    #    MD5 calculation on the device can take several minutes for large images.
+    #    Compare against firmware.target_md5 from group_vars.
+    # -------------------------------------------------------------------------
+    - name: Calculate MD5 hash of transferred image
+      cisco.ios.ios_command:
+        commands:
+          - "verify /md5 flash:{{ firmware.target_image }}"
+      register: md5_result
+      vars:
+        ansible_command_timeout: 600    # 10-minute timeout for MD5 on large files
+
+    - name: Assert MD5 hash matches expected value
+      ansible.builtin.assert:
+        that:
+          - firmware.target_md5 in md5_result.stdout[0]
+        fail_msg: >
+          MD5 MISMATCH on {{ inventory_hostname }} for {{ firmware.target_image }}.
+          Expected: {{ firmware.target_md5 }}.
+          DO NOT proceed with upgrade — delete the corrupt image and retry staging.
+        success_msg: "MD5 verified on {{ inventory_hostname }} — image integrity confirmed."
