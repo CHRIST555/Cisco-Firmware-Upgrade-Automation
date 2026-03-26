@@ -95,7 +95,7 @@ ansible-galaxy collection install cisco.ios
 **1. Clone the repository**
 
 ```bash
-git clone https://github.com/your-org/cisco-firmware-upgrade.git
+clone cisco-firmware-upgrade.git
 cd cisco-firmware-upgrade
 ```
 
