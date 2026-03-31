@@ -2,7 +2,7 @@
 
 Ansible playbooks for automating end-to-end firmware upgrades on Cisco IOS-XE devices (tested on Catalyst 9000 series), driven by an interactive Python CLI launcher.
 
-No file server needed. The launcher pushes the firmware image directly from your machine to each device over SSH.
+No file server. No config file editing. No vault setup. Drop your firmware files in the project folder and run the launcher.
 
 ---
 
@@ -13,7 +13,6 @@ No file server needed. The launcher pushes the firmware image directly from your
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
 - [Using the Launcher](#using-the-launcher)
-- [Configuration](#configuration)
 - [Running Playbooks Directly](#running-playbooks-directly)
 - [Upgrade Phases](#upgrade-phases)
 - [Output Files](#output-files)
@@ -31,37 +30,41 @@ This project automates the full lifecycle of a Cisco firmware upgrade across fou
 3. **Upgrade execution** — sets the boot variable, saves config, reloads the device, and waits for it to recover
 4. **Post-upgrade verification** — confirms the correct version booted, checks interface and routing protocol state, and writes a per-device report
 
-Everything is driven through `upgrade_tool.py` — a terminal wizard that asks you five questions and then runs Ansible.
+Everything is driven through `upgrade_tool.py` — a terminal wizard that asks you a few questions and then runs Ansible.
 
 ---
 
 ## Project Structure
 
 ```
-.
-├── upgrade_tool.py                # Interactive CLI launcher — start here
-├── site_firmware_upgrade.yml      # Master playbook — imports all four phases
-├── pre_upgrade_checks.yml         # Phase 1: readiness validation & config backup
-├── stage_firmware.yml             # Phase 2: direct file push & MD5 verification
-├── execute_upgrade.yml            # Phase 3: boot variable, reload, wait
-├── post_upgrade_verify.yml        # Phase 4: version check & service health
+cisco-firmware-upgrade/
+├── upgrade_tool.py                     # Interactive CLI launcher — start here
+│
+├── cat9k_iosxe.17.09.04a.SPA.bin      # ← drop your firmware image here
+├── cat9k_iosxe.17.09.04a.SPA.bin.md5  # ← drop your MD5 file here
+│
+├── site_firmware_upgrade.yml           # Master playbook — imports all four phases
+├── pre_upgrade_checks.yml              # Phase 1: readiness validation & config backup
+├── stage_firmware.yml                  # Phase 2: direct file push & MD5 verification
+├── execute_upgrade.yml                 # Phase 3: boot variable, reload, wait
+├── post_upgrade_verify.yml             # Phase 4: version check & service health
 │
 ├── group_vars/
 │   └── ios_routers/
-│       └── firmware.yml           # Image name, version, MD5, safety thresholds
+│       └── firmware.yml                # Safety thresholds (flash space, CPU limit)
 │
 ├── inventory/
-│   └── production.yml             # Optional static host inventory
+│   └── production.yml                  # Optional static host inventory
 │
 ├── backups/
-│   └── pre-upgrade/               # Config backups written here during Phase 1
+│   └── pre-upgrade/                    # Config backups written here during Phase 1
 │
 └── reports/
-    ├── pre-upgrade/               # Pre-upgrade state snapshots
-    └── post-upgrade/              # Per-device upgrade result reports
+    ├── pre-upgrade/                    # Pre-upgrade state snapshots
+    └── post-upgrade/                   # Per-device upgrade result reports
 ```
 
-> All output directories are created automatically the first time you run `upgrade_tool.py`.
+> All output directories (`backups/`, `reports/`) are created automatically on first run.
 
 ---
 
@@ -85,11 +88,7 @@ ansible-galaxy collection install cisco.ios ansible.netcommon
 
 - Cisco IOS-XE (Catalyst 9000 series recommended)
 - SSH access from your machine to the device management interfaces
-- Enough free flash space for the firmware image (~1 GB recommended)
-
-### Firmware file
-
-Just have the `.bin` file somewhere on your machine — `~/Downloads` or the project folder both work. The launcher will find it automatically.
+- Enough free flash space for the firmware image (~1 GB recommended headroom)
 
 ---
 
@@ -102,16 +101,15 @@ git clone https://github.com/your-org/cisco-firmware-upgrade.git
 cd cisco-firmware-upgrade
 ```
 
-**2. Update the firmware details**
+**2. Download your firmware from Cisco's software page and drop both files into the project folder**
 
-Edit `group_vars/ios_routers/firmware.yml` with the version string and MD5 hash for the image you are deploying. Both values are published on Cisco's software download page.
-
-```yaml
-firmware:
-  target_version: "17.09.04a"
-  target_image:   "cat9k_iosxe.17.09.04a.SPA.bin"
-  target_md5:     "a1b2c3d4e5f6..."
 ```
+cisco-firmware-upgrade/
+├── cat9k_iosxe.17.09.04a.SPA.bin
+└── cat9k_iosxe.17.09.04a.SPA.bin.md5
+```
+
+The `.md5` file is available on the same Cisco download page as the `.bin`. Downloading both means you never have to type or copy a checksum manually.
 
 **3. Run the launcher**
 
@@ -125,9 +123,33 @@ That's it. The launcher handles everything else interactively.
 
 ## Using the Launcher
 
-Run `python upgrade_tool.py` and follow the prompts — no flags or arguments needed.
+Run `python upgrade_tool.py` and follow the prompts. No flags or arguments needed.
 
-### Step 1 — Select upgrade phase
+### Step 1 — Firmware image
+
+The launcher searches the project folder, `~/Downloads`, and `~/Desktop` for `.bin` files and lists them automatically. Select yours from the list.
+
+```
+  ℹ  Found 1 .bin file(s):
+  [1] /root/cisco-firmware-upgrade/cat9k_iosxe.17.09.04a.SPA.bin  (847 MB)
+  [2] Enter a custom path
+```
+
+It then looks for a matching `.md5` file in the same folder and reads the checksum automatically:
+
+```
+  ✔  MD5 loaded from cat9k_iosxe.17.09.04a.SPA.bin.md5: a1b2c3d4...f6a1
+```
+
+If no `.md5` file is found it will ask you to enter the checksum manually.
+
+Next it asks for the target version string — this is auto-guessed from the filename so you usually just press Enter to confirm:
+
+```
+  ›  Target version [17.09.04a]:
+```
+
+### Step 2 — Select upgrade phase
 
 ```
   [1] ALL phases (full upgrade)
@@ -140,23 +162,20 @@ Run `python upgrade_tool.py` and follow the prompts — no flags or arguments ne
 
 Pick `1` for a full upgrade. Use individual phases to re-run a specific step if something fails.
 
-### Step 2 — SSH credentials
+### Step 3 — SSH credentials
 
-Enter your SSH username and select an SSH key. The launcher scans `~/.ssh` automatically and lists any keys it finds. If you don't use key-based auth, skip the key and Ansible will prompt for a password per device.
-
-### Step 3 — Firmware file
-
-The launcher searches your current directory, `~/Downloads`, and `~/firmware` for `.bin` files and lists them with their sizes. Pick one or type a custom path.
+Enter your SSH username. The launcher scans `~/.ssh` and the project folder for SSH keys and lists them automatically — pick one or enter a custom path.
 
 ```
-  ℹ  Found 1 .bin file(s):
-  [1] /home/user/Downloads/cat9k_iosxe.17.09.04a.SPA.bin  (847 MB)
+  ℹ  Found 1 SSH key(s):
+  [1] /root/.ssh/cisco_upgrade
   [2] Enter a custom path
+  [3] Skip — use password auth
 ```
 
 ### Step 4 — Device IP addresses
 
-Type device IPs or hostnames one at a time. Hostnames are resolved automatically. Give each device a friendly alias if you want (e.g. `core-rtr-01`), or press Enter to accept the auto-generated one.
+Type device IPs or hostnames one at a time. Give each one a friendly name or press Enter to accept the auto-generated alias.
 
 ```
   ›  Enter IP or hostname: 10.0.1.1
@@ -170,13 +189,15 @@ Type device IPs or hostnames one at a time. Hostnames are resolved automatically
 
 ### Step 5 — Review and confirm
 
-The launcher shows a full summary before anything runs:
+A full summary is shown before anything runs:
 
 ```
   Phase    :  ALL phases (full upgrade)
   Username :  netadmin
-  SSH Key  :  /home/user/.ssh/id_ed25519
+  SSH Key  :  /root/.ssh/cisco_upgrade
   Firmware :  cat9k_iosxe.17.09.04a.SPA.bin  (847.2 MB)
+  Version  :  17.09.04a
+  MD5      :  a1b2c3d4...f6a1
   Dry run  :  no
 
   Target devices:
@@ -190,49 +211,28 @@ Enter `y` to proceed or `n` to abort with no changes made.
 
 ---
 
-## Configuration
-
-The only file you need to edit is `group_vars/ios_routers/firmware.yml`:
-
-```yaml
-firmware:
-  target_version: "17.09.04a"                        # Must match 'show version' exactly
-  target_image:   "cat9k_iosxe.17.09.04a.SPA.bin"   # Exact .bin filename
-  target_md5:     "a1b2c3d4e5f6..."                  # MD5 from Cisco software portal
-
-  # Safety thresholds — pre-upgrade checks abort if these are not met
-  min_flash_space: 1000000000   # Free flash required in bytes (~1 GB)
-  cpu_threshold:   80           # Max 5-minute CPU % before aborting
-```
-
-`local_bin_path` is filled in automatically by the launcher. You only need to set it manually if running playbooks directly (see below).
-
-No passwords, no vault setup, no file server configuration needed.
-
----
-
 ## Running Playbooks Directly
 
-You can bypass the launcher and call `ansible-playbook` directly. You will need to pass the firmware file path as an extra variable:
+You can bypass the launcher and call `ansible-playbook` directly. Pass firmware details as extra variables:
 
 ```bash
-# Full upgrade
 ansible-playbook site_firmware_upgrade.yml \
   -i inventory/production.yml \
-  -u netadmin --private-key ~/.ssh/id_ed25519 \
-  -e "firmware_local_bin_path=/path/to/cat9k_iosxe.17.09.04a.SPA.bin"
+  -u netadmin --private-key ~/.ssh/cisco_upgrade \
+  -e "firmware_local_bin_path=/path/to/cat9k_iosxe.17.09.04a.SPA.bin" \
+  -e "firmware_target_image=cat9k_iosxe.17.09.04a.SPA.bin" \
+  -e "firmware_target_version=17.09.04a" \
+  -e "firmware_target_md5=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+```
 
+Run a single phase using tags:
+
+```bash
 # Stage only
-ansible-playbook site_firmware_upgrade.yml \
-  -i inventory/production.yml \
-  --tags stage \
-  -e "firmware_local_bin_path=/path/to/cat9k_iosxe.17.09.04a.SPA.bin"
+ansible-playbook site_firmware_upgrade.yml --tags stage [options]
 
-# Limit to specific devices
-ansible-playbook site_firmware_upgrade.yml \
-  -i inventory/production.yml \
-  --limit "core-rtr-01,core-rtr-02" \
-  -e "firmware_local_bin_path=/path/to/cat9k_iosxe.17.09.04a.SPA.bin"
+# Verify only
+ansible-playbook site_firmware_upgrade.yml --tags verify [options]
 ```
 
 | Tag | Phase |
@@ -262,15 +262,15 @@ Devices already on the target version are skipped automatically. A full config b
 
 - Checks if the image is already on flash — skips transfer if it is (idempotent)
 - Pushes the `.bin` file directly from your machine to device flash over SSH — no file server needed
-- Verifies MD5 hash — **aborts immediately on mismatch**
+- Verifies MD5 hash on the device — **aborts immediately on mismatch**
 
-`serial: 3` — three simultaneous transfers (reduce if your connection is slow).
+`serial: 3` — three simultaneous transfers (reduce in `stage_firmware.yml` if your connection is slow).
 
 ### Phase 3 — Execute Upgrade
 
 - Clears existing boot statements and sets the new image
 - Confirms boot variable with `show boot` before reloading
-- Saves configuration, then reloads
+- Saves configuration then reloads
 - Waits up to 10 minutes for SSH to recover
 - Pauses 60 s for routing protocols to stabilise
 
@@ -278,7 +278,7 @@ Devices already on the target version are skipped automatically. A full config b
 
 ### Phase 4 — Post-upgrade Verification
 
-- Asserts running version matches `target_version`
+- Asserts running version matches target version
 - Captures interface status and OSPF/BGP neighbour state
 - Writes a full upgrade report per device to `reports/post-upgrade/`
 
@@ -297,11 +297,12 @@ Devices already on the target version are skipped automatically. A full config b
 ## Safety Features
 
 - **Nothing runs without confirmation** — full summary shown before Ansible starts
-- **MD5 verification** — image integrity confirmed before boot variable is ever touched
+- **MD5 auto-read** — checksum loaded from `.md5` file, no manual copy-paste
+- **MD5 verification on device** — image integrity confirmed before boot variable is touched
 - **Pre-flight assertions** — flash space and CPU checked before any file is transferred
-- **Boot variable confirmation** — `show boot` checked before reload is triggered
+- **Boot variable confirmation** — `show boot` verified before reload is triggered
 - **`serial: 1` on reload** — one device rebooted at a time
-- **Idempotent staging** — existing flash images are reused, no re-transfers
+- **Idempotent staging** — existing flash images are reused, no unnecessary re-transfers
 - **Auto directory creation** — all output folders created automatically on first run
 
 ---
@@ -312,16 +313,19 @@ Devices already on the target version are skipped automatically. A full config b
 Increase `timeout` in the `wait_for` task in `execute_upgrade.yml` (default 600 s). Chassis platforms with many line cards can take longer to boot.
 
 **MD5 mismatch after staging**
-Delete the image on the device (`del flash:<image>`), verify `target_md5` in `firmware.yml` against Cisco's published value, and re-run Phase 2.
+Delete the image on the device (`del flash:<image>`), verify the `.md5` file matches what Cisco published, and re-run Phase 2.
 
 **Transfer times out**
-Increase `ansible_command_timeout` in `stage_firmware.yml` (default 2700 s / 45 min). Transfers over slow management-plane links can take a long time for large images.
+Increase `ansible_command_timeout` in `stage_firmware.yml` (default 2700 s / 45 min). Large images over slow management-plane links can take a long time.
 
 **Boot variable not accepted**
 Some platforms use `flash0:` instead of `flash:`. Adjust the `boot system` line in `execute_upgrade.yml`.
 
 **Wrong prompt order on reload**
 The `Save?` / `Proceed with reload?` prompt order varies by IOS-XE version. If the reload task hangs, swap the `prompt`/`answer` entries in `execute_upgrade.yml`.
+
+**Key file not found**
+Make sure you enter the full path to the key file, or drop the key in the project folder — the launcher searches there automatically alongside `~/.ssh`.
 
 ---
 
