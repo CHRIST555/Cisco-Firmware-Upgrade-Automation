@@ -114,13 +114,24 @@ PHASES = [
 # ── SSH credentials ──────────────────────────────────────────────────────────
 
 def find_ssh_keys():
-    """Return SSH private key paths found in ~/.ssh."""
-    ssh_dir = Path.home() / ".ssh"
+    """Return absolute paths to SSH private keys in ~/.ssh and the current directory."""
     candidates = []
+    # Standard key names in ~/.ssh
+    ssh_dir = Path.home() / ".ssh"
     if ssh_dir.exists():
         for pattern in ("id_rsa", "id_ed25519", "id_ecdsa", "*.pem", "*.key"):
             candidates.extend(ssh_dir.glob(pattern))
-    return [str(p) for p in candidates if p.is_file()]
+    # Also check current directory for keys (e.g. cagarc12_key dropped next to the tool)
+    for pattern in ("*.key", "*.pem", "*_key"):
+        candidates.extend(Path(".").glob(pattern))
+    # Deduplicate and return absolute paths
+    seen, result = set(), []
+    for p in candidates:
+        abs_p = str(p.resolve())
+        if p.is_file() and abs_p not in seen:
+            seen.add(abs_p)
+            result.append(abs_p)
+    return result
 
 def collect_ssh_credentials():
     section("SSH Credentials")
@@ -133,7 +144,7 @@ def collect_ssh_credentials():
     key_path = None
 
     if keys:
-        info(f"Found {len(keys)} SSH key(s) in ~/.ssh:")
+        info(f"Found {len(keys)} SSH key(s):")
         options = keys + ["Enter a custom path", "Skip — use password auth"]
         for i, k in enumerate(options, 1):
             print(f"  {c(f'[{i}]', YELLOW)} {k}")
@@ -143,18 +154,20 @@ def collect_ssh_credentials():
             try:
                 idx = int(raw) - 1
                 if idx == len(keys):
-                    key_path = prompt("Enter full path to SSH private key")
+                    entered = prompt("Enter full path to SSH private key").strip()
+                    key_path = str(Path(entered).resolve())
                 elif idx == len(keys) + 1:
                     key_path = None   # password auth
                 elif 0 <= idx < len(keys):
-                    key_path = keys[idx]
+                    key_path = keys[idx]   # already absolute
                 break
             except (ValueError, TypeError):
                 error("Invalid choice.")
     else:
-        warn("No SSH keys found in ~/.ssh.")
+        warn("No SSH keys found automatically.")
         raw = prompt("Enter full path to SSH private key (or press Enter for password auth)")
-        key_path = raw.strip() if raw else None
+        if raw:
+            key_path = str(Path(raw.strip()).resolve())
 
     if key_path:
         if not Path(key_path).exists():
@@ -417,10 +430,22 @@ def show_summary(phase_idx, username, key_path, firmware_path, devices, check, v
     for i, d in enumerate(devices, 1):
         print(f"  {c(str(i)+'.', DIM):<4} {c(d['alias'], BOLD):<34} {c(d['ip'], YELLOW)}")
     print()
-    display_cmd = [a for a in cmd
-                   if not a.startswith("/tmp/ansible_inv_")
-                   and not a.startswith("firmware_local_bin_path")]
-    display_cmd += ["-e", "firmware_local_bin_path=<selected file>"]
+    # Build a clean display version of the command
+    # Replace the temp inventory path with a readable label
+    # Replace the full firmware path with just the filename
+    display_cmd = []
+    skip_next = False
+    for i, a in enumerate(cmd):
+        if skip_next:
+            skip_next = False
+            continue
+        if a == "-i" and i + 1 < len(cmd) and cmd[i+1].startswith("/tmp/ansible_inv_"):
+            display_cmd += ["-i", "<dynamic-inventory>"]
+            skip_next = True
+        elif a.startswith("firmware_local_bin_path="):
+            display_cmd.append(f"firmware_local_bin_path={Path(firmware_path).name}")
+        else:
+            display_cmd.append(a)
     print(f"  {c('Command:', CYAN)}")
     wrapped = textwrap.fill(" ".join(display_cmd), width=58,
                             initial_indent="    ", subsequent_indent="      ")

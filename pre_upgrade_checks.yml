@@ -45,7 +45,7 @@
     - name: Check free flash space
       cisco.ios.ios_command:
         commands:
-          - dir flash: | include free    # IOS pipe filter — returns one line with free bytes
+          - "dir flash: | include free"    # IOS pipe filter — returns one line with free bytes
       register: flash_info
 
     - name: Parse free flash bytes
@@ -69,7 +69,7 @@
     - name: Sample CPU utilisation
       cisco.ios.ios_command:
         commands:
-          - show processes cpu | include CPU    # Returns a summary line, not per-process detail
+          - "show processes cpu | include CPU"    # Returns a summary line, not per-process detail
       register: cpu_info
 
     # The 5-minute average is the most reliable indicator of sustained load
