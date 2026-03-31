@@ -3,6 +3,7 @@
 # =============================================================================
 
 # Never commit firmware binaries to the repo
+# Drop your .bin file in the project root — it will be found automatically
 *.bin
 *.tar
 *.pkg

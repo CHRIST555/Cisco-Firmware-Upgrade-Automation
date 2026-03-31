@@ -182,24 +182,34 @@ def collect_ssh_credentials():
 # ── Firmware file browser ────────────────────────────────────────────────────
 
 def collect_firmware_file():
+    """
+    Ask the user to select a .bin file, then prompt for the target version
+    string and MD5 hash. Returns (firmware_path, target_version, target_md5).
+    No manual editing of firmware.yml required.
+    """
     section("Firmware Image")
-    info("Select the .bin firmware file on this machine to push to devices.")
+    info("Drop your .bin file in the same folder as upgrade_tool.py and it")
+    info("will appear here automatically.")
     print()
 
     search_dirs = [
-        ".",
-        "./firmware",
+        ".",                          # Project root — checked first
         str(Path.home() / "Downloads"),
-        str(Path.home() / "firmware"),
+        str(Path.home() / "Desktop"),
         "/tmp",
     ]
 
     found_bins = []
     for d in search_dirs:
         found_bins.extend(glob.glob(os.path.join(d, "*.bin")))
-    # Deduplicate while preserving order
-    seen = set()
-    found_bins = [f for f in found_bins if not (f in seen or seen.add(f))]
+    # Deduplicate and resolve to absolute paths
+    seen, resolved = set(), []
+    for f in found_bins:
+        abs_f = str(Path(f).resolve())
+        if abs_f not in seen:
+            seen.add(abs_f)
+            resolved.append(abs_f)
+    found_bins = resolved
 
     firmware_path = None
 
@@ -234,10 +244,56 @@ def collect_firmware_file():
         error(f"File not found: {firmware_path}")
         sys.exit(1)
 
-    filename = Path(firmware_path).name
-    size_mb  = os.path.getsize(firmware_path) / (1024 * 1024)
+    import re as _re
+
+    firmware_path = str(Path(firmware_path).resolve())
+    filename      = Path(firmware_path).name
+    firmware_dir  = Path(firmware_path).parent
+    size_mb       = os.path.getsize(firmware_path) / (1024 * 1024)
     success(f"Selected: {filename}  ({size_mb:.1f} MB)")
-    return str(Path(firmware_path).resolve())   # Return absolute path
+
+    # ── MD5 — try to read from a .md5 file next to the .bin ──────────────────
+    # Cisco downloads a companion file named either:
+    #   <imagename>.bin.md5  or  <imagename>.md5
+    # It contains a line like:
+    #   MD5 : a1b2c3d4e5f6...   or just the hash on its own
+    print()
+    target_md5 = None
+    for md5_candidate in [
+        firmware_dir / (filename + ".md5"),
+        firmware_dir / (Path(filename).stem + ".md5"),
+    ]:
+        if md5_candidate.exists():
+            raw_md5 = md5_candidate.read_text().strip()
+            # Extract the 32-char hex hash — ignore labels like "MD5 :"
+            match = _re.search(r"[0-9a-fA-F]{32}", raw_md5)
+            if match:
+                target_md5 = match.group(0).lower()
+                success(f"MD5 loaded from {md5_candidate.name}: {target_md5[:8]}...{target_md5[-4:]}")
+                break
+
+    if not target_md5:
+        info("No .md5 file found next to the .bin — please enter the MD5 manually.")
+        info("Drop a '<imagename>.md5' file in the same folder to skip this step next time.")
+        while True:
+            target_md5 = prompt("MD5 checksum (32 hex characters)").strip().lower()
+            if _re.fullmatch(r"[0-9a-f]{32}", target_md5):
+                break
+            error("Must be exactly 32 hex characters — check Cisco's software download page.")
+
+    # ── Target version string ─────────────────────────────────────────────────
+    # Auto-guess from filename: cat9k_iosxe.17.09.04a.SPA.bin → 17.09.04a
+    ver_guess   = _re.search(r"(\d+\.\d+\.\d+[a-z]?)", filename)
+    ver_default = ver_guess.group(1) if ver_guess else ""
+    print()
+    info("Enter the IOS-XE version string exactly as shown in 'show version'.")
+    target_version = prompt("Target version", default=ver_default).strip()
+    while not target_version:
+        error("Version string is required.")
+        target_version = prompt("Target version").strip()
+
+    success(f"Version: {target_version}  |  MD5: {target_md5[:8]}...{target_md5[-4:]}")
+    return firmware_path, target_version, target_md5
 
 # ── IP address input & validation ────────────────────────────────────────────
 
@@ -391,7 +447,7 @@ def ensure_directories():
 # ── Build ansible-playbook command ───────────────────────────────────────────
 
 def build_command(phase_idx, inventory, username, key_path,
-                  check, verbose, firmware_path):
+                  check, verbose, firmware_path, target_version, target_md5):
     _, playbook, tags = PHASES[phase_idx]
 
     cmd = ["ansible-playbook", playbook, "-i", inventory, "-u", username]
@@ -405,22 +461,27 @@ def build_command(phase_idx, inventory, username, key_path,
     if verbose:
         cmd += ["-v"]
 
-    # Pass the local firmware path and derived image name into the playbooks
+    # Pass firmware details into the playbooks as extra vars —
+    # these override anything set in group_vars/ios_routers/firmware.yml
     firmware_filename = Path(firmware_path).name
     cmd += ["-e", f"firmware_local_bin_path={firmware_path}"]
     cmd += ["-e", f"firmware_target_image={firmware_filename}"]
+    cmd += ["-e", f"firmware_target_version={target_version}"]
+    cmd += ["-e", f"firmware_target_md5={target_md5}"]
 
     return cmd
 
 # ── Summary screen ───────────────────────────────────────────────────────────
 
-def show_summary(phase_idx, username, key_path, firmware_path, devices, check, verbose, cmd):
+def show_summary(phase_idx, username, key_path, firmware_path, target_version, target_md5, devices, check, verbose, cmd):
     section("Summary — Review Before Running")
     phase_label = PHASES[phase_idx][0]
     print(f"  {c('Phase    :', CYAN)}  {phase_label}")
     print(f"  {c('Username :', CYAN)}  {username}")
     print(f"  {c('SSH Key  :', CYAN)}  {key_path or c('(password auth)', DIM)}")
     print(f"  {c('Firmware :', CYAN)}  {Path(firmware_path).name}  {c(f'({os.path.getsize(firmware_path)/1024/1024:.1f} MB)', DIM)}")
+    print(f"  {c('Version  :', CYAN)}  {target_version}")
+    print(f"  {c('MD5      :', CYAN)}  {target_md5[:8]}...{target_md5[-4:]}")
     print(f"  {c('Dry run  :', CYAN)}  {'yes (--check)' if check else 'no'}")
     print(f"  {c('Verbose  :', CYAN)}  {'yes' if verbose else 'no'}")
     print()
@@ -463,14 +524,14 @@ def main():
 
     banner()
 
-    # 1. Phase
+    # 1. Firmware file, version string, and MD5 — no firmware.yml editing needed
+    firmware_path, target_version, target_md5 = collect_firmware_file()
+
+    # 2. Phase
     phase_idx = numbered_menu("Select Upgrade Phase", PHASES)
 
-    # 2. SSH credentials
+    # 3. SSH credentials
     username, key_path = collect_ssh_credentials()
-
-    # 3. Firmware file — mandatory, exits if not found
-    firmware_path = collect_firmware_file()
 
     # 4. Device IPs → dynamic inventory
     devices     = collect_device_ips()
@@ -481,11 +542,12 @@ def main():
 
     # 6. Build command
     cmd = build_command(phase_idx, dynamic_inv, username, key_path,
-                        check, verbose, firmware_path)
+                        check, verbose, firmware_path, target_version, target_md5)
 
     # 7. Summary + confirm
     banner()
-    show_summary(phase_idx, username, key_path, firmware_path, devices, check, verbose, cmd)
+    show_summary(phase_idx, username, key_path, firmware_path,
+                 target_version, target_md5, devices, check, verbose, cmd)
 
     go = prompt("Proceed? (y/n)", default="y")
     if go.lower() != "y":
