@@ -107,6 +107,27 @@ cd cisco-firmware-upgrade
 
 Edit `group_vars/ios_routers/firmware.yml` with your target image name, MD5 hash (from Cisco's software download page), and file server address.
 
+
+# SSH server is usually already installed, but just in case
+sudo apt install openssh-server
+
+# Create a locked-down firmware user
+sudo useradd -m -s /bin/bash firmware
+sudo passwd firmware          # set the password — this goes into vault.yml
+
+# Create the firmware directory
+sudo mkdir -p /firmware/cisco/ios
+sudo chown firmware:firmware /firmware/cisco/ios
+
+# Copy your .bin file onto the server
+scp cat9k_iosxe.17.09.04a.SPA.bin firmware@<server-ip>:/firmware/cisco/ios/
+```
+
+Then confirm the router can actually reach it before running the playbook:
+```
+router# ping 10.10.1.100 source <management-interface>
+router# copy scp://firmware@10.10.1.100/firmware/cisco/ios/cat9k_iosxe.17.09.04a.SPA.bin flash:
+
 **3. Store the SCP password in Ansible Vault**
 
 ```bash
