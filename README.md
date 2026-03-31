@@ -1,6 +1,8 @@
 # 🔧 Cisco IOS-XE Firmware Upgrade Automation
 
-Ansible playbooks for automating end-to-end firmware upgrades on Cisco IOS-XE devices (tested on Catalyst 9000 series), driven by an interactive Python CLI launcher. Enter your device IPs, pick your SSH key, select a firmware image, choose an upgrade phase — and let it run.
+Ansible playbooks for automating end-to-end firmware upgrades on Cisco IOS-XE devices (tested on Catalyst 9000 series), driven by an interactive Python CLI launcher.
+
+No file server needed. The launcher pushes the firmware image directly from your machine to each device over SSH.
 
 ---
 
@@ -25,11 +27,11 @@ Ansible playbooks for automating end-to-end firmware upgrades on Cisco IOS-XE de
 This project automates the full lifecycle of a Cisco firmware upgrade across four phases:
 
 1. **Pre-flight checks** — validates version, free flash space, and CPU health; skips devices already on the target release; backs up running config
-2. **Image staging** — transfers the firmware image via SCP and verifies MD5 integrity
+2. **Image staging** — pushes the firmware `.bin` file directly from your machine to each device's flash over SSH, then verifies MD5 integrity
 3. **Upgrade execution** — sets the boot variable, saves config, reloads the device, and waits for it to recover
 4. **Post-upgrade verification** — confirms the correct version booted, checks interface and routing protocol state, and writes a per-device report
 
-Everything is driven through `upgrade_tool.py` — an interactive terminal launcher that walks you through device IPs, credentials, firmware selection, and phase choice before building and running the Ansible command.
+Everything is driven through `upgrade_tool.py` — a terminal wizard that asks you five questions and then runs Ansible.
 
 ---
 
@@ -39,58 +41,55 @@ Everything is driven through `upgrade_tool.py` — an interactive terminal launc
 .
 ├── upgrade_tool.py                # Interactive CLI launcher — start here
 ├── site_firmware_upgrade.yml      # Master playbook — imports all four phases
-├── pre_upgrade_checks.yml         # Phase 1: readiness validation & backup
-├── stage_firmware.yml             # Phase 2: SCP transfer & MD5 verification
+├── pre_upgrade_checks.yml         # Phase 1: readiness validation & config backup
+├── stage_firmware.yml             # Phase 2: direct file push & MD5 verification
 ├── execute_upgrade.yml            # Phase 3: boot variable, reload, wait
 ├── post_upgrade_verify.yml        # Phase 4: version check & service health
 │
 ├── group_vars/
 │   └── ios_routers/
-│       ├── firmware.yml           # Upgrade variables (image, server, thresholds)
-│       └── vault.yml              # Ansible Vault — encrypted secrets
+│       └── firmware.yml           # Image name, version, MD5, safety thresholds
 │
 ├── inventory/
 │   └── production.yml             # Optional static host inventory
 │
 ├── backups/
-│   └── pre-upgrade/               # Config backups (auto-created per run)
+│   └── pre-upgrade/               # Config backups written here during Phase 1
 │
 └── reports/
     ├── pre-upgrade/               # Pre-upgrade state snapshots
     └── post-upgrade/              # Per-device upgrade result reports
 ```
 
+> All output directories are created automatically the first time you run `upgrade_tool.py`.
+
 ---
 
 ## Requirements
 
-### Control Node
+### Control Node (your machine)
 
 | Requirement | Version |
 |---|---|
 | Python | ≥ 3.9 |
 | Ansible | ≥ 2.14 |
 | `cisco.ios` collection | ≥ 4.6 |
-
-Install dependencies:
+| `ansible.netcommon` collection | ≥ 5.0 |
 
 ```bash
 pip install ansible
-ansible-galaxy collection install cisco.ios
+ansible-galaxy collection install cisco.ios ansible.netcommon
 ```
-
-> `paramiko` is optional but recommended for SSH key handling: `pip install paramiko`
 
 ### Network Devices
 
-- Cisco IOS-XE devices (Catalyst 9000 series recommended)
-- SSH access from the Ansible control node
-- SCP server reachable from the device management plane
+- Cisco IOS-XE (Catalyst 9000 series recommended)
+- SSH access from your machine to the device management interfaces
+- Enough free flash space for the firmware image (~1 GB recommended)
 
-### File Server
+### Firmware file
 
-- SCP (or TFTP/FTP) server hosting the firmware `.bin` image
-- A user account with read access to the image directory
+Just have the `.bin` file somewhere on your machine — `~/Downloads` or the project folder both work. The launcher will find it automatically.
 
 ---
 
@@ -103,106 +102,88 @@ git clone https://github.com/your-org/cisco-firmware-upgrade.git
 cd cisco-firmware-upgrade
 ```
 
-**2. Set the firmware details**
+**2. Update the firmware details**
 
-Edit `group_vars/ios_routers/firmware.yml` with your target image name, MD5 hash (from Cisco's software download page), and file server address.
+Edit `group_vars/ios_routers/firmware.yml` with the version string and MD5 hash for the image you are deploying. Both values are published on Cisco's software download page.
 
-
-**3. Store the SCP password in Ansible Vault**
-
-```bash
-ansible-vault encrypt_string 'your-scp-password' --name 'vault_firmware_password'
+```yaml
+firmware:
+  target_version: "17.09.04a"
+  target_image:   "cat9k_iosxe.17.09.04a.SPA.bin"
+  target_md5:     "a1b2c3d4e5f6..."
 ```
 
-Paste the output into `group_vars/ios_routers/vault.yml`.
-
-**4. Run the launcher**
+**3. Run the launcher**
 
 ```bash
 python upgrade_tool.py
 ```
 
-The tool will guide you through the rest interactively.
+That's it. The launcher handles everything else interactively.
 
 ---
 
 ## Using the Launcher
 
-`upgrade_tool.py` is a step-by-step terminal wizard. No flags or arguments needed — just run it and follow the prompts.
+Run `python upgrade_tool.py` and follow the prompts — no flags or arguments needed.
 
 ### Step 1 — Select upgrade phase
 
 ```
-  ┌─ Select Upgrade Phase ────────────────────────────────────
   [1] ALL phases (full upgrade)
   [2] Phase 1 — Pre-upgrade checks only
   [3] Phase 2 — Stage firmware only
   [4] Phase 3 — Execute upgrade only
   [5] Phase 4 — Post-upgrade verify only
-  [6] Phases 1 + 2 (check + stage, no reload)
+  [6] Phases 1 + 2 (checks + stage, no reload)
 ```
+
+Pick `1` for a full upgrade. Use individual phases to re-run a specific step if something fails.
 
 ### Step 2 — SSH credentials
 
-- Enter your SSH username (defaults to your current system user)
-- The tool scans `~/.ssh` and lists any existing keys — pick one, enter a custom path, or skip to use password auth
-- Optionally enter your Ansible Vault password (hidden input) to decrypt the SCP credentials in `vault.yml`
+Enter your SSH username and select an SSH key. The launcher scans `~/.ssh` automatically and lists any keys it finds. If you don't use key-based auth, skip the key and Ansible will prompt for a password per device.
 
-### Step 3 — Firmware image
+### Step 3 — Firmware file
 
-The tool searches `./firmware`, `~/Downloads`, `/tmp`, and the current directory for `.bin` files and lists them with their sizes. Pick one from the list or enter a custom path.
-
-### Step 4 — Target devices
-
-Choose how to specify your devices:
-
-**Option 1 — Enter IP addresses now (recommended)**
-
-Type device IPs or hostnames one at a time. The tool:
-- Validates each entry as a proper IPv4/IPv6 address or hostname
-- Resolves hostnames to IPs automatically (DNS lookup)
-- Rejects duplicates
-- Lets you assign a friendly alias to each device (e.g. `core-rtr-01`)
-- Lets you remove entries by number if you make a mistake
-- Writes a temporary Ansible inventory file automatically — deleted after the run
+The launcher searches your current directory, `~/Downloads`, and `~/firmware` for `.bin` files and lists them with their sizes. Pick one or type a custom path.
 
 ```
-  ›  Enter IP address or hostname: 10.0.1.1
+  ℹ  Found 1 .bin file(s):
+  [1] /home/user/Downloads/cat9k_iosxe.17.09.04a.SPA.bin  (847 MB)
+  [2] Enter a custom path
+```
+
+### Step 4 — Device IP addresses
+
+Type device IPs or hostnames one at a time. Hostnames are resolved automatically. Give each device a friendly alias if you want (e.g. `core-rtr-01`), or press Enter to accept the auto-generated one.
+
+```
+  ›  Enter IP or hostname: 10.0.1.1
   ✔  Added: device-10-0-1-1  (10.0.1.1)
 
-  ›  Enter IP address or hostname: core-rtr-02.example.com
-  ✔  Resolved core-rtr-02.example.com → 10.0.1.2
-  ✔  Added: core-rtr-02.example.com  (10.0.1.2)
+  ›  Enter IP or hostname: 10.0.1.2
+  ✔  Added: device-10-0-1-2  (10.0.1.2)
 
-  ›  Enter IP address or hostname:   ← press Enter when done
+  ›  Enter IP or hostname:        ← press Enter when done
 ```
 
-**Option 2 — Use an existing inventory file**
+### Step 5 — Review and confirm
 
-Point to your own `inventory/production.yml` or any other Ansible inventory file. Optionally limit to specific hostnames.
-
-### Step 5 — Run options
-
-Choose whether to do a dry run (`--check`, no changes applied) and whether to enable verbose Ansible output.
-
-### Step 6 — Summary & confirm
-
-Before anything runs, the tool shows a full summary including a table of every target device:
+The launcher shows a full summary before anything runs:
 
 ```
-  Phase      :  ALL phases (full upgrade)
-  Username   :  netadmin
-  SSH Key    :  /home/user/.ssh/id_ed25519
-  Vault      :  ✔ configured
-  Firmware   :  cat9k_iosxe.17.09.04a.SPA.bin
-  Dry run    :  no
+  Phase    :  ALL phases (full upgrade)
+  Username :  netadmin
+  SSH Key  :  /home/user/.ssh/id_ed25519
+  Firmware :  cat9k_iosxe.17.09.04a.SPA.bin  (847.2 MB)
+  Dry run  :  no
 
   Target devices:
-  #    Alias                     IP Address
-  ────────────────────────────────────────────────
-  1.   core-rtr-01               10.0.1.1
-  2.   core-rtr-02               10.0.1.2
-  3.   dist-sw-01                10.0.2.1
+  #    Alias                IP Address
+  ──────────────────────────────────────────────
+  1.   core-rtr-01          10.0.1.1
+  2.   core-rtr-02          10.0.1.2
 ```
 
 Enter `y` to proceed or `n` to abort with no changes made.
@@ -211,71 +192,47 @@ Enter `y` to proceed or `n` to abort with no changes made.
 
 ## Configuration
 
-All upgrade parameters live in `group_vars/ios_routers/firmware.yml`:
+The only file you need to edit is `group_vars/ios_routers/firmware.yml`:
 
 ```yaml
 firmware:
-  target_version:       "17.09.04a"                        # Must match 'show version' output exactly
-  target_image:         "cat9k_iosxe.17.09.04a.SPA.bin"   # Exact filename on flash / file server
-  target_md5:           "a1b2c3d4e5f6..."                  # MD5 from Cisco software download portal
-  target_size_mb:       850                                # For informational logging only
+  target_version: "17.09.04a"                        # Must match 'show version' exactly
+  target_image:   "cat9k_iosxe.17.09.04a.SPA.bin"   # Exact .bin filename
+  target_md5:     "a1b2c3d4e5f6..."                  # MD5 from Cisco software portal
 
-  file_server:          "10.10.1.100"
-  file_server_protocol: "scp"
-  file_server_path:     "/firmware/cisco/ios"
-  file_server_user:     "firmware"
-  file_server_password: "{{ vault_firmware_password }}"    # Set via Ansible Vault — never plain text
-
-  min_flash_space:      1000000000     # Bytes of free flash required (~1 GB)
-  cpu_threshold:        80             # Max 5-minute CPU % allowed before aborting
+  # Safety thresholds — pre-upgrade checks abort if these are not met
+  min_flash_space: 1000000000   # Free flash required in bytes (~1 GB)
+  cpu_threshold:   80           # Max 5-minute CPU % before aborting
 ```
 
-> ⚠️ **Never commit plain-text passwords.** Always use `ansible-vault` for `file_server_password`.
+`local_bin_path` is filled in automatically by the launcher. You only need to set it manually if running playbooks directly (see below).
+
+No passwords, no vault setup, no file server configuration needed.
 
 ---
 
 ## Running Playbooks Directly
 
-You can bypass the launcher and call `ansible-playbook` directly if needed.
-
-### Full upgrade
+You can bypass the launcher and call `ansible-playbook` directly. You will need to pass the firmware file path as an extra variable:
 
 ```bash
+# Full upgrade
 ansible-playbook site_firmware_upgrade.yml \
   -i inventory/production.yml \
   -u netadmin --private-key ~/.ssh/id_ed25519 \
-  --ask-vault-pass
-```
+  -e "firmware_local_bin_path=/path/to/cat9k_iosxe.17.09.04a.SPA.bin"
 
-### Single phase via tag
-
-```bash
-# Stage firmware only
+# Stage only
 ansible-playbook site_firmware_upgrade.yml \
   -i inventory/production.yml \
-  --tags stage --ask-vault-pass
+  --tags stage \
+  -e "firmware_local_bin_path=/path/to/cat9k_iosxe.17.09.04a.SPA.bin"
 
-# Post-upgrade verification only
-ansible-playbook site_firmware_upgrade.yml \
-  -i inventory/production.yml \
-  --tags verify --ask-vault-pass
-```
-
-### Limit to specific devices
-
-```bash
+# Limit to specific devices
 ansible-playbook site_firmware_upgrade.yml \
   -i inventory/production.yml \
   --limit "core-rtr-01,core-rtr-02" \
-  --ask-vault-pass
-```
-
-### Dry run
-
-```bash
-ansible-playbook site_firmware_upgrade.yml \
-  -i inventory/production.yml \
-  --check --ask-vault-pass
+  -e "firmware_local_bin_path=/path/to/cat9k_iosxe.17.09.04a.SPA.bin"
 ```
 
 | Tag | Phase |
@@ -289,7 +246,7 @@ ansible-playbook site_firmware_upgrade.yml \
 
 ## Upgrade Phases
 
-### Phase 1 — Pre-upgrade Checks (`pre_upgrade_checks.yml`)
+### Phase 1 — Pre-upgrade Checks
 
 | Check | Pass condition |
 |---|---|
@@ -297,34 +254,32 @@ ansible-playbook site_firmware_upgrade.yml \
 | Free flash space | > `min_flash_space` bytes (~1 GB) |
 | CPU utilisation | < `cpu_threshold` % (5-minute average) |
 
-Devices already on the target version are skipped automatically. A full config backup and state snapshot are saved before any changes are made.
+Devices already on the target version are skipped automatically. A full config backup and state snapshot are saved before any changes.
 
-`serial: 1` — one device checked at a time.
+`serial: 1` — one device at a time.
 
-### Phase 2 — Stage Firmware (`stage_firmware.yml`)
+### Phase 2 — Stage Firmware
 
-- Checks whether the image already exists on flash — skips transfer if it does (idempotent)
-- Copies the image via SCP with a 30-minute timeout
-- Verifies MD5 hash — **aborts immediately if there is a mismatch**
-- SCP password is suppressed from all logs (`no_log: true`)
+- Checks if the image is already on flash — skips transfer if it is (idempotent)
+- Pushes the `.bin` file directly from your machine to device flash over SSH — no file server needed
+- Verifies MD5 hash — **aborts immediately on mismatch**
 
-`serial: 5` — up to five simultaneous transfers.
+`serial: 3` — three simultaneous transfers (reduce if your connection is slow).
 
-### Phase 3 — Execute Upgrade (`execute_upgrade.yml`)
+### Phase 3 — Execute Upgrade
 
 - Clears existing boot statements and sets the new image
 - Confirms boot variable with `show boot` before reloading
-- Saves configuration, then issues `reload`
-- Waits up to 10 minutes for SSH to recover (120 s initial delay)
-- Pauses 60 s for routing protocols to stabilise after reboot
+- Saves configuration, then reloads
+- Waits up to 10 minutes for SSH to recover
+- Pauses 60 s for routing protocols to stabilise
 
 `serial: 1` — **one device reloaded at a time.**
 
-### Phase 4 — Post-upgrade Verification (`post_upgrade_verify.yml`)
+### Phase 4 — Post-upgrade Verification
 
-- Asserts running version matches `target_version` — fails loudly if not
-- Captures interface status (`show ip interface brief`)
-- Checks OSPF neighbour and BGP summary state
+- Asserts running version matches `target_version`
+- Captures interface status and OSPF/BGP neighbour state
 - Writes a full upgrade report per device to `reports/post-upgrade/`
 
 ---
@@ -334,44 +289,39 @@ Devices already on the target version are skipped automatically. A full config b
 | Path | Contents |
 |---|---|
 | `backups/pre-upgrade/<host>_<version>.cfg` | Full running-config backup |
-| `reports/pre-upgrade/<host>.yml` | Version, flash space, CPU snapshot before upgrade |
-| `reports/post-upgrade/<host>.txt` | Version confirmed, interface state, OSPF/BGP status |
+| `reports/pre-upgrade/<host>.yml` | Version, flash space, CPU snapshot |
+| `reports/post-upgrade/<host>.txt` | Version confirmed, interfaces, routing state |
 
 ---
 
 ## Safety Features
 
-- **Interactive review** — full device list and command shown before anything runs
-- **MD5 verification** — image integrity confirmed before boot variable is ever set
-- **Pre-flight assertions** — flash space and CPU thresholds must pass or the host is skipped
+- **Nothing runs without confirmation** — full summary shown before Ansible starts
+- **MD5 verification** — image integrity confirmed before boot variable is ever touched
+- **Pre-flight assertions** — flash space and CPU checked before any file is transferred
 - **Boot variable confirmation** — `show boot` checked before reload is triggered
-- **`serial: 1` on reload** — only one device rebooted at a time
-- **Vault-protected secrets** — SCP password never stored in plain text
-- **`no_log: true` on SCP task** — password suppressed from Ansible output and logs
-- **Temp file cleanup** — dynamically generated inventory and vault password files are always deleted after the run, even on abort or error
-- **Idempotent staging** — existing flash images are reused; no unnecessary re-transfers
+- **`serial: 1` on reload** — one device rebooted at a time
+- **Idempotent staging** — existing flash images are reused, no re-transfers
+- **Auto directory creation** — all output folders created automatically on first run
 
 ---
 
 ## Troubleshooting
 
 **Device does not come back after reload**
-Increase the `timeout` value in the `wait_for` task in `execute_upgrade.yml` (default: 600 s). Chassis platforms with many line cards may take longer to fully boot.
+Increase `timeout` in the `wait_for` task in `execute_upgrade.yml` (default 600 s). Chassis platforms with many line cards can take longer to boot.
 
 **MD5 mismatch after staging**
-Delete the image on the device with `del flash:<image>`, verify `target_md5` in `firmware.yml` against Cisco's published checksum, and re-run the staging phase.
+Delete the image on the device (`del flash:<image>`), verify `target_md5` in `firmware.yml` against Cisco's published value, and re-run Phase 2.
 
-**SCP transfer times out**
-Increase `ansible_command_timeout` on the copy task (default: 1800 s). Check firewall rules between the device management interface and the file server on port 22.
+**Transfer times out**
+Increase `ansible_command_timeout` in `stage_firmware.yml` (default 2700 s / 45 min). Transfers over slow management-plane links can take a long time for large images.
 
 **Boot variable not accepted**
-Some IOS-XE platforms use `flash0:` instead of `flash:`. Adjust the `boot system` line in `execute_upgrade.yml` to match your platform.
+Some platforms use `flash0:` instead of `flash:`. Adjust the `boot system` line in `execute_upgrade.yml`.
 
 **Wrong prompt order on reload**
-The prompt order (`Save?` vs `Proceed with reload?`) varies by IOS-XE version. If the reload task hangs, swap the `prompt`/`answer` entries in `execute_upgrade.yml`.
-
-**Hostname not resolving in the launcher**
-If DNS is not available from the control node, enter IP addresses directly instead of hostnames. The generated inventory uses the resolved IP, so DNS is only needed at launch time.
+The `Save?` / `Proceed with reload?` prompt order varies by IOS-XE version. If the reload task hangs, swap the `prompt`/`answer` entries in `execute_upgrade.yml`.
 
 ---
 

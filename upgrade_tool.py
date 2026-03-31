@@ -2,16 +2,16 @@
 # =============================================================================
 # upgrade_tool.py — Interactive Cisco Firmware Upgrade Launcher
 # =============================================================================
-# Presents a terminal UI to:
+# Walks you through:
 #   1. Select which upgrade phase(s) to run
-#   2. Configure SSH credentials (username + key file)
-#   3. Browse and select the firmware .bin file
-#   4. Optionally limit to specific devices
-#   5. Build and execute the correct ansible-playbook command
+#   2. Enter SSH credentials (username + key file)
+#   3. Select the firmware .bin file from your machine
+#   4. Enter device IP addresses
+#   5. Review and confirm — then Ansible runs
 #
 # Requirements:
-#   pip install ansible                  (for ansible-playbook)
-#   pip install paramiko                 (optional: SSH key validation)
+#   pip install ansible
+#   ansible-galaxy collection install cisco.ios ansible.netcommon
 #
 # Usage:
 #   python upgrade_tool.py
@@ -40,7 +40,6 @@ GREEN  = "\033[92m"
 YELLOW = "\033[93m"
 CYAN   = "\033[96m"
 WHITE  = "\033[97m"
-BLUE   = "\033[94m"
 
 def c(text, *codes):
     return "".join(codes) + str(text) + RESET
@@ -57,7 +56,7 @@ def banner():
     print(c("   ╚═════╝╚═╝╚══════╝ ╚═════╝ ╚═════╝ ", CYAN))
     print()
     print(c("  Cisco IOS-XE Firmware Upgrade Tool", BOLD + WHITE))
-    print(c("  Ansible Automation Launcher  v1.1", DIM))
+    print(c("  Ansible Automation Launcher  v2.0", DIM))
     print(c("═" * width, CYAN))
     print()
 
@@ -82,57 +81,42 @@ def prompt(msg, default=None):
     val = input(c("  ›  ", CYAN) + msg + suffix + " ").strip()
     return val if val else default
 
-def numbered_menu(title, options, multi=False):
-    """Display a numbered menu. Returns index (single) or list of indices (multi)."""
+def numbered_menu(title, options):
+    """Display a numbered menu and return the chosen index."""
     section(title)
     for i, opt in enumerate(options, 1):
-        label = opt if isinstance(opt, str) else opt[0]
-        desc  = "" if isinstance(opt, str) else opt[1]
-        num   = c(f"  [{i}]", YELLOW)
-        print(f"{num} {c(label, BOLD)}" + (f"\n       {c(desc, DIM)}" if desc else ""))
+        label = opt[0] if isinstance(opt, tuple) else opt
+        desc  = opt[1] if isinstance(opt, tuple) and len(opt) > 1 else ""
+        print(f"  {c(f'[{i}]', YELLOW)} {c(label, BOLD)}" +
+              (f"\n       {c(desc, DIM)}" if desc else ""))
     print()
-
-    if multi:
-        raw = prompt("Enter numbers separated by commas (e.g. 1,3) or press Enter for ALL")
-        if not raw:
-            return list(range(len(options)))
-        chosen = []
-        for part in raw.split(","):
-            try:
-                idx = int(part.strip()) - 1
-                if 0 <= idx < len(options):
-                    chosen.append(idx)
-            except ValueError:
-                pass
-        return chosen if chosen else list(range(len(options)))
-    else:
-        while True:
-            raw = prompt("Enter number")
-            try:
-                idx = int(raw) - 1
-                if 0 <= idx < len(options):
-                    return idx
-            except (ValueError, TypeError):
-                pass
-            error("Invalid choice — try again.")
+    while True:
+        raw = prompt("Enter number")
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(options):
+                return idx
+        except (ValueError, TypeError):
+            pass
+        error("Invalid choice — try again.")
 
 # ── Phase definitions ────────────────────────────────────────────────────────
 
 PHASES = [
-    ("ALL phases (full upgrade)",          "site_firmware_upgrade.yml",  None),
-    ("Phase 1 — Pre-upgrade checks only",  "site_firmware_upgrade.yml",  "preflight,pre_upgrade"),
-    ("Phase 2 — Stage firmware only",      "site_firmware_upgrade.yml",  "stage"),
-    ("Phase 3 — Execute upgrade only",     "site_firmware_upgrade.yml",  "upgrade,reload"),
-    ("Phase 4 — Post-upgrade verify only", "site_firmware_upgrade.yml",  "verify,post_upgrade"),
-    ("Phases 1 + 2 (check + stage, no reload)", "site_firmware_upgrade.yml", "preflight,pre_upgrade,stage"),
+    ("ALL phases (full upgrade)",               "site_firmware_upgrade.yml", None),
+    ("Phase 1 — Pre-upgrade checks only",       "site_firmware_upgrade.yml", "preflight,pre_upgrade"),
+    ("Phase 2 — Stage firmware only",           "site_firmware_upgrade.yml", "stage"),
+    ("Phase 3 — Execute upgrade only",          "site_firmware_upgrade.yml", "upgrade,reload"),
+    ("Phase 4 — Post-upgrade verify only",      "site_firmware_upgrade.yml", "verify,post_upgrade"),
+    ("Phases 1 + 2 (checks + stage, no reload)","site_firmware_upgrade.yml", "preflight,pre_upgrade,stage"),
 ]
 
-# ── SSH credential helpers ───────────────────────────────────────────────────
+# ── SSH credentials ──────────────────────────────────────────────────────────
 
 def find_ssh_keys():
-    """Return a list of likely SSH private key paths on this machine."""
-    candidates = []
+    """Return SSH private key paths found in ~/.ssh."""
     ssh_dir = Path.home() / ".ssh"
+    candidates = []
     if ssh_dir.exists():
         for pattern in ("id_rsa", "id_ed25519", "id_ecdsa", "*.pem", "*.key"):
             candidates.extend(ssh_dir.glob(pattern))
@@ -140,29 +124,28 @@ def find_ssh_keys():
 
 def collect_ssh_credentials():
     section("SSH Credentials")
-    info("These credentials will be passed to Ansible for device login.")
+    info("These are used to log into your Cisco devices.")
     print()
 
     username = prompt("SSH username", default=os.environ.get("USER", "admin"))
 
-    # Key file selection
-    keys = find_ssh_keys()
+    keys     = find_ssh_keys()
     key_path = None
 
     if keys:
         info(f"Found {len(keys)} SSH key(s) in ~/.ssh:")
-        key_options = keys + ["Enter a custom path"]
-        for i, k in enumerate(key_options, 1):
+        options = keys + ["Enter a custom path", "Skip — use password auth"]
+        for i, k in enumerate(options, 1):
             print(f"  {c(f'[{i}]', YELLOW)} {k}")
         print()
         while True:
-            raw = prompt("Select key number or press Enter to skip (password auth)")
-            if not raw:
-                break
+            raw = prompt("Select key number")
             try:
                 idx = int(raw) - 1
                 if idx == len(keys):
                     key_path = prompt("Enter full path to SSH private key")
+                elif idx == len(keys) + 1:
+                    key_path = None   # password auth
                 elif 0 <= idx < len(keys):
                     key_path = keys[idx]
                 break
@@ -170,33 +153,26 @@ def collect_ssh_credentials():
                 error("Invalid choice.")
     else:
         warn("No SSH keys found in ~/.ssh.")
-        raw = prompt("Enter full path to SSH private key (or press Enter to use password auth)")
-        if raw:
-            key_path = raw.strip()
+        raw = prompt("Enter full path to SSH private key (or press Enter for password auth)")
+        key_path = raw.strip() if raw else None
 
     if key_path:
         if not Path(key_path).exists():
-            warn(f"Key file not found: {key_path}  — Ansible may fail.")
+            warn(f"Key file not found: {key_path} — Ansible may fail.")
         else:
             success(f"Using key: {key_path}")
+    else:
+        info("No key selected — Ansible will prompt for a password per device.")
 
-    vault_pass = None
-    print()
-    info("Ansible Vault password is needed to decrypt firmware credentials.")
-    use_vault = prompt("Use Ansible Vault? (y/n)", default="y")
-    if use_vault.lower() == "y":
-        vault_pass = getpass("  ›  Vault password (hidden): ")
-
-    return username, key_path, vault_pass
+    return username, key_path
 
 # ── Firmware file browser ────────────────────────────────────────────────────
 
 def collect_firmware_file():
-    section("Firmware Image Selection")
-    info("Select the .bin firmware image to use for this upgrade campaign.")
+    section("Firmware Image")
+    info("Select the .bin firmware file on this machine to push to devices.")
     print()
 
-    # Search common locations
     search_dirs = [
         ".",
         "./firmware",
@@ -208,6 +184,9 @@ def collect_firmware_file():
     found_bins = []
     for d in search_dirs:
         found_bins.extend(glob.glob(os.path.join(d, "*.bin")))
+    # Deduplicate while preserving order
+    seen = set()
+    found_bins = [f for f in found_bins if not (f in seen or seen.add(f))]
 
     firmware_path = None
 
@@ -217,15 +196,12 @@ def collect_firmware_file():
         for i, f in enumerate(options, 1):
             size = ""
             if os.path.exists(f):
-                mb = os.path.getsize(f) / (1024 * 1024)
+                mb   = os.path.getsize(f) / (1024 * 1024)
                 size = c(f"  ({mb:.0f} MB)", DIM)
             print(f"  {c(f'[{i}]', YELLOW)} {f}{size}")
         print()
-
         while True:
-            raw = prompt("Select firmware file number (or press Enter to skip)")
-            if not raw:
-                break
+            raw = prompt("Select firmware file number")
             try:
                 idx = int(raw) - 1
                 if idx == len(found_bins):
@@ -237,26 +213,22 @@ def collect_firmware_file():
                 error("Invalid choice.")
     else:
         warn("No .bin files found in common locations.")
-        firmware_path = prompt("Enter full path to firmware .bin file (or press Enter to skip)")
+        firmware_path = prompt("Enter full path to firmware .bin file")
         if firmware_path:
             firmware_path = firmware_path.strip()
 
-    if firmware_path:
-        if not Path(firmware_path).exists():
-            warn(f"File not found: {firmware_path}")
-            firmware_path = None
-        else:
-            filename = Path(firmware_path).name
-            size_mb  = os.path.getsize(firmware_path) / (1024 * 1024)
-            success(f"Selected: {filename}  ({size_mb:.1f} MB)")
-            info("Make sure firmware.yml target_image matches this filename.")
+    if not firmware_path or not Path(firmware_path).exists():
+        error(f"File not found: {firmware_path}")
+        sys.exit(1)
 
-    return firmware_path
+    filename = Path(firmware_path).name
+    size_mb  = os.path.getsize(firmware_path) / (1024 * 1024)
+    success(f"Selected: {filename}  ({size_mb:.1f} MB)")
+    return str(Path(firmware_path).resolve())   # Return absolute path
 
 # ── IP address input & validation ────────────────────────────────────────────
 
 def is_valid_ip(value):
-    """Return True if value is a valid IPv4 or IPv6 address."""
     try:
         ipaddress.ip_address(value)
         return True
@@ -264,46 +236,39 @@ def is_valid_ip(value):
         return False
 
 def is_valid_hostname(value):
-    """Return True if value looks like a valid hostname (basic check)."""
     if len(value) > 253:
         return False
-    allowed = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$")
+    allowed = re.compile(
+        r"^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?"
+        r"(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$"
+    )
     return bool(allowed.match(value))
 
 def resolve_hostname(host):
-    """Try to resolve a hostname to an IP for display purposes."""
     try:
         return socket.gethostbyname(host)
     except socket.gaierror:
         return None
 
 def collect_device_ips():
-    """
-    Interactive prompt to build a list of (hostname/alias, ip_address) tuples.
-    Returns the list plus a flag indicating whether a dynamic inventory was built.
-    """
     section("Target Device IP Addresses")
-    info("Enter the IP addresses (or hostnames) of devices to upgrade.")
-    info("Press Enter with no input when done. Minimum 1 device required.")
+    info("Enter the IP address or hostname of each device to upgrade.")
+    info("Press Enter with no input when you are done.")
     print()
 
-    devices = []   # list of {"alias": str, "ip": str}
+    devices = []
 
     while True:
-        # Show current list
         if devices:
             print(c("  Current device list:", CYAN))
-            print(f"  {'#':<4} {'Alias/Hostname':<25} {'IP Address'}", )
-            print(c("  " + "─" * 52, DIM))
+            print(f"  {'#':<4} {'Alias':<25} {'IP Address'}")
+            print(c("  " + "─" * 50, DIM))
             for i, d in enumerate(devices, 1):
-                alias_col = c(d["alias"], BOLD)
-                ip_col    = c(d["ip"], YELLOW) if d["ip"] != d["alias"] else c("(direct)", DIM)
-                print(f"  {c(str(i)+'.',DIM):<4} {alias_col:<34} {ip_col}")
+                print(f"  {c(str(i)+'.', DIM):<4} {c(d['alias'], BOLD):<34} {c(d['ip'], YELLOW)}")
             print()
 
-        # Prompt for next IP
         raw = prompt(
-            f"Enter IP address or hostname (or press Enter to finish{', add more' if devices else ''})"
+            "Enter IP or hostname" + (" (or press Enter to finish)" if devices else "")
         )
 
         if not raw:
@@ -314,30 +279,25 @@ def collect_device_ips():
 
         raw = raw.strip()
 
-        # Validate
         if is_valid_ip(raw):
-            ip     = raw
-            # Auto-generate a friendly alias: replace dots/colons with dashes
-            alias  = "device-" + raw.replace(".", "-").replace(":", "-")
-            # Let user optionally name it
-            custom = prompt(f"Alias/hostname for {ip} (press Enter for '{alias}')", default=alias)
+            ip    = raw
+            alias = "device-" + raw.replace(".", "-").replace(":", "-")
+            custom = prompt(f"Alias for {ip}", default=alias)
             alias  = custom.strip() if custom else alias
         elif is_valid_hostname(raw):
-            alias   = raw
+            alias    = raw
             resolved = resolve_hostname(raw)
             if resolved:
                 success(f"Resolved {raw} → {resolved}")
                 ip = resolved
             else:
-                warn(f"Could not resolve '{raw}' — will use it as-is (ensure DNS works from devices).")
+                warn(f"Could not resolve '{raw}' — using as-is.")
                 ip = raw
         else:
-            error(f"'{raw}' is not a valid IP address or hostname. Try again.")
+            error(f"'{raw}' is not a valid IP address or hostname.")
             continue
 
-        # Check for duplicates
-        existing_ips = [d["ip"] for d in devices]
-        if ip in existing_ips:
+        if ip in [d["ip"] for d in devices]:
             warn(f"{ip} is already in the list — skipping.")
             continue
 
@@ -345,7 +305,6 @@ def collect_device_ips():
         success(f"Added: {alias}  ({ip})")
         print()
 
-        # After each addition, offer quick removal
         if len(devices) > 1:
             remove = prompt("Remove a device by number? (press Enter to continue)")
             if remove:
@@ -359,38 +318,21 @@ def collect_device_ips():
 
     return devices
 
+# ── Dynamic inventory writer ─────────────────────────────────────────────────
 
 def write_dynamic_inventory(devices, username, key_path):
-    """
-    Write a temporary Ansible inventory YAML file from the device list.
-    Returns the path to the temp file (caller must delete it).
-
-    Generated structure:
-        all:
-          children:
-            upgrade_candidates:
-              hosts:
-                <alias>:
-                  ansible_host: <ip>
-                  ansible_user: <username>
-                  ansible_ssh_private_key_file: <key>   # if provided
-                  ansible_network_os: ios
-                  ansible_connection: network_cli
-    """
+    """Write a temporary Ansible inventory file and return its path."""
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".yml", prefix="ansible_inv_", delete=False
     )
-
     lines = [
-        "# Auto-generated inventory — created by upgrade_tool.py",
-        "# This file is deleted automatically after the playbook run.",
+        "# Auto-generated by upgrade_tool.py — deleted after run",
         "---",
         "all:",
         "  children:",
         "    upgrade_candidates:",
         "      hosts:",
     ]
-
     for d in devices:
         lines.append(f"        {d['alias']}:")
         lines.append(f"          ansible_host: {d['ip']}")
@@ -399,183 +341,95 @@ def write_dynamic_inventory(devices, username, key_path):
         lines.append( "          ansible_connection: network_cli")
         if key_path:
             lines.append(f"          ansible_ssh_private_key_file: {key_path}")
-
     tmp.write("\n".join(lines) + "\n")
     tmp.close()
     os.chmod(tmp.name, 0o600)
     return tmp.name
 
-
-# ── Inventory / host limit ───────────────────────────────────────────────────
-
-def collect_inventory_options(username, key_path):
-    """
-    Offer two paths:
-      A) Enter IPs now → write a dynamic inventory temp file
-      B) Use an existing inventory file on disk
-    Returns (inventory_path, limit_string, devices_list, dynamic_inv_path)
-    dynamic_inv_path is set only when we wrote a temp file (so main() can delete it).
-    """
-    section("Inventory & Target Devices")
-
-    print(f"  {c('[1]', YELLOW)} {c('Enter device IP addresses now', BOLD)}")
-    print(f"       {c('Type in IPs interactively — a temporary inventory is generated', DIM)}")
-    print(f"  {c('[2]', YELLOW)} {c('Use an existing inventory file', BOLD)}")
-    print(f"       {c('Point to your own hosts.yml / production.yml', DIM)}")
-    print()
-
-    while True:
-        choice = prompt("Select option", default="1")
-        if choice in ("1", "2"):
-            break
-        error("Enter 1 or 2.")
-
-    devices       = []
-    dynamic_inv   = None
-    limit         = None
-
-    if choice == "1":
-        # ── Dynamic: collect IPs and write temp inventory ──────────────────
-        devices     = collect_device_ips()
-        dynamic_inv = write_dynamic_inventory(devices, username, key_path)
-        inventory   = dynamic_inv
-        success(f"Temporary inventory written: {dynamic_inv}")
-        info(f"{len(devices)} device(s) added to upgrade_candidates group.")
-
-    else:
-        # ── Existing file ──────────────────────────────────────────────────
-        inv_candidates = (
-            glob.glob("inventory/*.yml") +
-            glob.glob("inventory/*.yaml") +
-            glob.glob("inventory/*.ini") +
-            glob.glob("hosts") +
-            glob.glob("hosts.yml")
-        )
-
-        inventory = "inventory/production.yml"   # sensible default
-        if inv_candidates:
-            info("Available inventory files:")
-            for i, f in enumerate(inv_candidates, 1):
-                print(f"  {c(f'[{i}]', YELLOW)} {f}")
-            print(f"  {c('[Enter]', DIM)} Use default: {inventory}")
-            print()
-            raw = prompt("Select inventory file")
-            if raw:
-                try:
-                    idx = int(raw) - 1
-                    if 0 <= idx < len(inv_candidates):
-                        inventory = inv_candidates[idx]
-                except (ValueError, TypeError):
-                    pass
-        else:
-            custom = prompt("Path to inventory file", default=inventory)
-            inventory = custom
-
-        limit = prompt("Limit to specific hosts? (comma-separated, or press Enter for ALL)")
-        limit = limit.strip() if limit else None
-
-    return inventory, limit, devices, dynamic_inv
-
-# ── Dry-run option ───────────────────────────────────────────────────────────
+# ── Run options ──────────────────────────────────────────────────────────────
 
 def collect_run_options():
     section("Run Options")
-    check = prompt("Dry run only? (--check, no changes applied) (y/n)", default="n")
+    check   = prompt("Dry run? (--check, no changes applied) (y/n)", default="n")
     verbose = prompt("Verbose output? (-v) (y/n)", default="n")
     return check.lower() == "y", verbose.lower() == "y"
 
-# ── Build and display the command ────────────────────────────────────────────
+# ── Directory scaffolding ────────────────────────────────────────────────────
+
+def ensure_directories():
+    """Create all directories the playbooks write output to."""
+    required = [
+        "backups/pre-upgrade",
+        "reports/pre-upgrade",
+        "reports/post-upgrade",
+        "group_vars/ios_routers",
+        "inventory",
+    ]
+    created = []
+    for d in required:
+        if not os.path.exists(d):
+            os.makedirs(d)
+            created.append(d)
+    if created:
+        section("Creating Output Directories")
+        for d in created:
+            success(f"Created: {d}/")
+
+# ── Build ansible-playbook command ───────────────────────────────────────────
 
 def build_command(phase_idx, inventory, username, key_path,
-                  vault_pass, limit, check, verbose, firmware_path):
+                  check, verbose, firmware_path):
     _, playbook, tags = PHASES[phase_idx]
 
-    cmd = ["ansible-playbook", playbook, "-i", inventory]
+    cmd = ["ansible-playbook", playbook, "-i", inventory, "-u", username]
 
-    # SSH user
-    cmd += ["-u", username]
-
-    # SSH key
     if key_path:
         cmd += ["--private-key", key_path]
-
-    # Tags
     if tags:
         cmd += ["--tags", tags]
-
-    # Limit
-    if limit:
-        cmd += ["--limit", limit]
-
-    # Check mode
     if check:
         cmd += ["--check"]
-
-    # Verbose
     if verbose:
         cmd += ["-v"]
 
-    # Extra vars — pass firmware image filename if user selected one
-    extra_vars = {}
-    if firmware_path:
-        extra_vars["firmware_override_image"] = Path(firmware_path).name
-
-    if extra_vars:
-        ev_str = " ".join(f"{k}={v}" for k, v in extra_vars.items())
-        cmd += ["-e", ev_str]
+    # Pass the local firmware path and derived image name into the playbooks
+    firmware_filename = Path(firmware_path).name
+    cmd += ["-e", f"firmware_local_bin_path={firmware_path}"]
+    cmd += ["-e", f"firmware_target_image={firmware_filename}"]
 
     return cmd
 
-def write_vault_pass_file(vault_pass):
-    """Write vault password to a temp file so it isn't visible in ps output."""
-    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".vp", delete=False)
-    tmp.write(vault_pass)
-    tmp.close()
-    os.chmod(tmp.name, 0o600)
-    return tmp.name
+# ── Summary screen ───────────────────────────────────────────────────────────
 
-# ── Confirmation summary ─────────────────────────────────────────────────────
-
-def show_summary(phase_idx, inventory, username, key_path,
-                 vault_pass, limit, check, verbose, firmware_path, devices, cmd):
+def show_summary(phase_idx, username, key_path, firmware_path, devices, check, verbose, cmd):
     section("Summary — Review Before Running")
     phase_label = PHASES[phase_idx][0]
-    print(f"  {c('Phase      :', CYAN)}  {phase_label}")
-    print(f"  {c('Inventory  :', CYAN)}  {inventory}")
-    print(f"  {c('Username   :', CYAN)}  {username}")
-    print(f"  {c('SSH Key    :', CYAN)}  {key_path or c('(password auth)', DIM)}")
-    print(f"  {c('Vault      :', CYAN)}  {'✔ configured' if vault_pass else c('✖ not set', YELLOW)}")
-    print(f"  {c('Limit      :', CYAN)}  {limit or c('ALL hosts', DIM)}")
-    print(f"  {c('Firmware   :', CYAN)}  {Path(firmware_path).name if firmware_path else c('use firmware.yml value', DIM)}")
-    print(f"  {c('Dry run    :', CYAN)}  {'yes (--check)' if check else 'no'}")
-    print(f"  {c('Verbose    :', CYAN)}  {'yes' if verbose else 'no'}")
-
-    # Show device table if IPs were entered manually
-    if devices:
-        print()
-        print(f"  {c('Target devices:', CYAN)}")
-        print(f"  {'#':<4} {'Alias':<25} {'IP Address'}")
-        print(c("  " + "─" * 46, DIM))
-        for i, d in enumerate(devices, 1):
-            print(f"  {c(str(i)+'.',DIM):<4} {c(d['alias'], BOLD):<34} {c(d['ip'], YELLOW)}")
-
+    print(f"  {c('Phase    :', CYAN)}  {phase_label}")
+    print(f"  {c('Username :', CYAN)}  {username}")
+    print(f"  {c('SSH Key  :', CYAN)}  {key_path or c('(password auth)', DIM)}")
+    print(f"  {c('Firmware :', CYAN)}  {Path(firmware_path).name}  {c(f'({os.path.getsize(firmware_path)/1024/1024:.1f} MB)', DIM)}")
+    print(f"  {c('Dry run  :', CYAN)}  {'yes (--check)' if check else 'no'}")
+    print(f"  {c('Verbose  :', CYAN)}  {'yes' if verbose else 'no'}")
     print()
-    # Show command (mask vault pass file path for cleanliness)
-    display_cmd = [a for a in cmd if not a.endswith(".vp") and not a.startswith("/tmp/ansible_inv_")]
-    if vault_pass:
-        display_cmd += ["--vault-password-file", "<temp-file>"]
-    if devices:
-        display_cmd += ["-i", "<dynamic-inventory>"]
+    print(f"  {c('Target devices:', CYAN)}")
+    print(f"  {'#':<4} {'Alias':<25} {'IP Address'}")
+    print(c("  " + "─" * 46, DIM))
+    for i, d in enumerate(devices, 1):
+        print(f"  {c(str(i)+'.', DIM):<4} {c(d['alias'], BOLD):<34} {c(d['ip'], YELLOW)}")
+    print()
+    display_cmd = [a for a in cmd
+                   if not a.startswith("/tmp/ansible_inv_")
+                   and not a.startswith("firmware_local_bin_path")]
+    display_cmd += ["-e", "firmware_local_bin_path=<selected file>"]
     print(f"  {c('Command:', CYAN)}")
     wrapped = textwrap.fill(" ".join(display_cmd), width=58,
                             initial_indent="    ", subsequent_indent="      ")
     print(c(wrapped, BOLD))
     print()
 
-# ── Main flow ────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    # Check ansible-playbook is available
     if not shutil.which("ansible-playbook"):
         banner()
         error("ansible-playbook not found in PATH.")
@@ -584,48 +438,40 @@ def main():
 
     banner()
 
-    # 1. Phase selection
-    phase_idx = numbered_menu(
-        "Select Upgrade Phase",
-        [(p[0], "") for p in PHASES]
-    )
+    # 1. Phase
+    phase_idx = numbered_menu("Select Upgrade Phase", PHASES)
 
     # 2. SSH credentials
-    username, key_path, vault_pass = collect_ssh_credentials()
+    username, key_path = collect_ssh_credentials()
 
-    # 3. Firmware file
+    # 3. Firmware file — mandatory, exits if not found
     firmware_path = collect_firmware_file()
 
-    # 4. Inventory + host limit (passes username & key so dynamic inv can embed them)
-    inventory, limit, devices, dynamic_inv = collect_inventory_options(username, key_path)
+    # 4. Device IPs → dynamic inventory
+    devices     = collect_device_ips()
+    dynamic_inv = write_dynamic_inventory(devices, username, key_path)
 
     # 5. Run options
     check, verbose = collect_run_options()
 
     # 6. Build command
-    cmd = build_command(phase_idx, inventory, username, key_path,
-                        vault_pass, limit, check, verbose, firmware_path)
-
-    vault_file = None
-    if vault_pass:
-        vault_file = write_vault_pass_file(vault_pass)
-        cmd += ["--vault-password-file", vault_file]
+    cmd = build_command(phase_idx, dynamic_inv, username, key_path,
+                        check, verbose, firmware_path)
 
     # 7. Summary + confirm
     banner()
-    show_summary(phase_idx, inventory, username, key_path,
-                 vault_pass, limit, check, verbose, firmware_path, devices, cmd)
+    show_summary(phase_idx, username, key_path, firmware_path, devices, check, verbose, cmd)
 
     go = prompt("Proceed? (y/n)", default="y")
     if go.lower() != "y":
         warn("Aborted — no changes made.")
-        if vault_file:
-            os.unlink(vault_file)
-        if dynamic_inv and os.path.exists(dynamic_inv):
-            os.unlink(dynamic_inv)
+        os.unlink(dynamic_inv)
         sys.exit(0)
 
-    # 8. Run
+    # 8. Create output directories
+    ensure_directories()
+
+    # 9. Run Ansible
     section("Running Ansible")
     print()
     try:
@@ -640,10 +486,7 @@ def main():
         print()
         warn("Interrupted by user.")
     finally:
-        # Always clean up temp files
-        if vault_file and os.path.exists(vault_file):
-            os.unlink(vault_file)
-        if dynamic_inv and os.path.exists(dynamic_inv):
+        if os.path.exists(dynamic_inv):
             os.unlink(dynamic_inv)
 
     print()
