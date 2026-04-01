@@ -1,69 +1,48 @@
 # =============================================================================
-# site_firmware_upgrade.yml  —  MASTER PLAYBOOK
-# Purpose : Orchestrate the full Cisco IOS-XE firmware upgrade lifecycle by
-#           importing each phase playbook in sequence.
+# site_firmware_upgrade.yml — MASTER PLAYBOOK
+# Purpose : Run all four upgrade phases in sequence.
+#           Each phase auto-detects whether the target is IOS-XE or CBS
+#           and runs the appropriate tasks automatically.
 #
-# Upgrade phases (run in order):
-#   1. pre_upgrade_checks.yml   — readiness validation & config backup
-#   2. stage_firmware.yml       — SCP image transfer & MD5 verify
-#   3. execute_upgrade.yml      — set boot var, reload, wait for recovery
-#   4. post_upgrade_verify.yml  — version check, service health, report
+# Supported platforms:
+#   - Cisco IOS-XE  (Catalyst 9000 series and similar)
+#   - Cisco CBS     (Business Switch — CBS250, CBS350 series)
 #
 # Usage:
-#   Full run (all phases):
-#     ansible-playbook site_firmware_upgrade.yml -i inventory/production.yml \
-#       --ask-vault-pass
+#   Full run:
+#     python upgrade_tool.py
 #
-#   Dry-run (check mode — skips IOS commands that make changes):
-#     ansible-playbook site_firmware_upgrade.yml -i inventory/production.yml \
-#       --ask-vault-pass --check
+#   Direct (all phases):
+#     ansible-playbook site_firmware_upgrade.yml -i <inventory> [options]
 #
-#   Single phase only (useful for re-running a failed step):
-#     ansible-playbook stage_firmware.yml -i inventory/production.yml \
-#       --ask-vault-pass
+#   Single phase by tag:
+#     ansible-playbook site_firmware_upgrade.yml --tags stage [options]
 #
-#   Limit to specific devices:
-#     ansible-playbook site_firmware_upgrade.yml -i inventory/production.yml \
-#       --ask-vault-pass --limit "core-rtr-01,core-rtr-02"
-#
-#   Stop before reload (pre-checks + staging only):
-#     ansible-playbook site_firmware_upgrade.yml -i inventory/production.yml \
-#       --ask-vault-pass --tags preflight,stage
-#
-# Prerequisites:
-#   - group_vars/ios_routers/firmware.yml populated with correct image details
-#   - Ansible Vault secret available (vault_firmware_password)
-#   - Reports directories exist on the control node (or will be created by tasks):
-#       reports/pre-upgrade/
-#       reports/post-upgrade/
-#       backups/pre-upgrade/
-#   - Cisco IOS-XE collection installed:
-#       ansible-galaxy collection install cisco.ios
+# Tags:
+#   preflight / pre_upgrade   → Phase 1
+#   stage                     → Phase 2
+#   upgrade / reload          → Phase 3
+#   verify / post_upgrade     → Phase 4
 # =============================================================================
-
 ---
 
-# Phase 1 — Validate all devices are ready; skip those already on target version
 - name: "PHASE 1/4 — Pre-upgrade checks"
   ansible.builtin.import_playbook: pre_upgrade_checks.yml
   tags:
     - preflight
     - pre_upgrade
 
-# Phase 2 — Transfer firmware image and verify MD5 (parallel, up to serial:5)
 - name: "PHASE 2/4 — Stage firmware"
   ansible.builtin.import_playbook: stage_firmware.yml
   tags:
     - stage
 
-# Phase 3 — Set boot variable and reload (serial: 1 — one device at a time)
 - name: "PHASE 3/4 — Execute upgrade (reload)"
   ansible.builtin.import_playbook: execute_upgrade.yml
   tags:
     - upgrade
     - reload
 
-# Phase 4 — Confirm correct version booted and services recovered
 - name: "PHASE 4/4 — Post-upgrade verification"
   ansible.builtin.import_playbook: post_upgrade_verify.yml
   tags:

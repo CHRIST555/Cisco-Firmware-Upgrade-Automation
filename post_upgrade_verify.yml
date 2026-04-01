@@ -1,10 +1,9 @@
 # =============================================================================
 # post_upgrade_verify.yml
-# Purpose : Confirm the device booted the correct firmware version and that
-#           key services (interfaces, routing protocols) have recovered.
-#           Generates a per-device upgrade report on the control node.
+# Purpose : Confirm the device booted the correct firmware and key services
+#           have recovered. Platform detected automatically.
 # Outputs : reports/post-upgrade/<hostname>.txt
-# Run order: 4 of 4  →  pre_upgrade_checks → stage_firmware → execute_upgrade → [HERE]
+# Run order: 4 of 4
 # =============================================================================
 ---
 - name: Post-upgrade verification
@@ -14,91 +13,125 @@
 
   tasks:
 
-    # -------------------------------------------------------------------------
-    # 1. Version verification — the most critical check
-    #    If the device booted the wrong image the assert fails and the play
-    #    stops for this host so the operator is alerted immediately.
-    # -------------------------------------------------------------------------
-    - name: Retrieve IOS-XE version after reboot
+    # =========================================================================
+    # PLATFORM DETECTION
+    # =========================================================================
+
+    - name: Get show version output
       cisco.ios.ios_command:
         commands:
           - show version
       register: post_version
 
-    - name: Parse running version from 'show version' output
+    - name: Detect platform type
       ansible.builtin.set_fact:
-        new_version: "{{ post_version.stdout[0] | regex_search('Version ([\\S]+)', '\\1') | first }}"
+        platform: >-
+          {{ 'iosxe' if ('IOS XE' in post_version.stdout[0] or 'IOS-XE' in post_version.stdout[0])
+             else 'cbs' if ('CBS' in post_version.stdout[0] or 'Active-image' in post_version.stdout[0])
+             else 'unknown' }}
 
-    - name: Assert device is running the target firmware version
+    # =========================================================================
+    # VERSION VERIFICATION
+    # =========================================================================
+
+    - name: Parse running version (IOS-XE)
+      ansible.builtin.set_fact:
+        new_version: >-
+          {{ post_version.stdout[0]
+             | regex_search('Version\s+(\S+)', '\1')
+             | first }}
+      when: platform == 'iosxe'
+
+    - name: Parse running version (CBS)
+      ansible.builtin.set_fact:
+        new_version: >-
+          {{ post_version.stdout[0]
+             | regex_search('Active-image:.*\n\s+Version:\s+(\S+)', '\1')
+             | first }}
+      when: platform == 'cbs'
+
+    - name: Assert device is running the target version
       ansible.builtin.assert:
         that:
-          - new_version == firmware.target_version
+          - new_version == firmware_target_version | default(firmware.target_version)
         fail_msg: >
           UPGRADE FAILED on {{ inventory_hostname }}:
-          running {{ new_version }}, expected {{ firmware.target_version }}.
+          running {{ new_version }},
+          expected {{ firmware_target_version | default(firmware.target_version) }}.
           Check boot variable and flash contents manually.
-        success_msg: "Version OK on {{ inventory_hostname }}: now running {{ new_version }}."
+        success_msg: >
+          Version OK on {{ inventory_hostname }}: now running {{ new_version }}.
 
-    # -------------------------------------------------------------------------
-    # 2. Interface status check
-    #    Captures 'show ip interface brief' for the report. A full assert on
-    #    interface states is not done here because some interfaces may legitimately
-    #    be admin-down — review the report output manually.
-    # -------------------------------------------------------------------------
-    - name: Collect interface status
+    # =========================================================================
+    # SERVICE HEALTH CHECKS — platform specific
+    # =========================================================================
+
+    # IOS-XE interface check
+    - name: Collect interface status (IOS-XE)
       cisco.ios.ios_command:
         commands:
           - show ip interface brief
       register: interfaces
+      ignore_errors: true
+      when: platform == 'iosxe'
 
-    # -------------------------------------------------------------------------
-    # 3. Routing protocol recovery
-    #    ignore_errors: true is used because not all devices run OSPF or BGP.
-    #    The debug tasks below surface the results without failing the play.
-    # -------------------------------------------------------------------------
-    - name: Collect OSPF neighbor and BGP summary
+    # CBS interface check — uses different command
+    - name: Collect interface status (CBS)
       cisco.ios.ios_command:
         commands:
-          - show ip ospf neighbor      # OSPF adjacency table
-          - show ip bgp summary        # BGP peer summary (requires BGP to be configured)
-      register: routing
-      ignore_errors: true    # Non-fatal: device may not run OSPF or BGP
+          - show interfaces status
+      register: interfaces
+      ignore_errors: true
+      when: platform == 'cbs'
 
-    # Count the number of OSPF adjacencies in FULL state as a health indicator
-    - name: Report OSPF full adjacency count
+    # IOS-XE routing protocol check
+    - name: Collect OSPF and BGP status (IOS-XE)
+      cisco.ios.ios_command:
+        commands:
+          - show ip ospf neighbor
+          - show ip bgp summary
+      register: routing
+      ignore_errors: true
+      when: platform == 'iosxe'
+
+    # CBS routing check — show ip route is the most universal command
+    - name: Collect routing table summary (CBS)
+      cisco.ios.ios_command:
+        commands:
+          - show ip route
+      register: routing
+      ignore_errors: true
+      when: platform == 'cbs'
+
+    - name: Report OSPF adjacency count (IOS-XE)
       ansible.builtin.debug:
         msg: >
-          {{ inventory_hostname }} OSPF FULL neighbors: {{ routing.stdout[0] | regex_findall('FULL') | length }}.
-          (0 may be normal if this device does not run OSPF.)
-      when: routing is succeeded
+          {{ inventory_hostname }} OSPF FULL neighbors:
+          {{ routing.stdout[0] | regex_findall('FULL') | length }}.
+      when: platform == 'iosxe' and routing is succeeded
 
-    # -------------------------------------------------------------------------
-    # 4. Upgrade report — written to the control node for auditing
-    #    previous_version is sourced from the pre-upgrade snapshot set_fact.
-    #    If the pre-upgrade play was not run in the same Ansible run,
-    #    hostvars may not contain current_version — the default('unknown') guard
-    #    handles that case gracefully.
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # UPGRADE REPORT
+    # =========================================================================
+
     - name: Write upgrade report to control node
       ansible.builtin.copy:
         content: |
           ============================================================
           Upgrade Report: {{ inventory_hostname }}
           ============================================================
+          Platform         : {{ platform | upper }}
           Previous Version : {{ hostvars[inventory_hostname].current_version | default('unknown') }}
           Current Version  : {{ new_version }}
-          Target Version   : {{ firmware.target_version }}
-          Status           : {{ 'SUCCESS' if new_version == firmware.target_version else 'FAILED' }}
+          Target Version   : {{ firmware_target_version | default(firmware.target_version) }}
+          Status           : {{ 'SUCCESS' if new_version == firmware_target_version | default(firmware.target_version) else 'FAILED' }}
           Timestamp (UTC)  : {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}
           ------------------------------------------------------------
           Interface Summary:
-          {{ interfaces.stdout[0] }}
+          {{ interfaces.stdout[0] | default('N/A') }}
           ------------------------------------------------------------
-          OSPF Neighbors:
+          Routing Summary:
           {{ routing.stdout[0] | default('N/A') }}
-          ------------------------------------------------------------
-          BGP Summary:
-          {{ routing.stdout[1] | default('N/A') }}
           ============================================================
         dest: "reports/post-upgrade/{{ inventory_hostname }}.txt"
-      delegate_to: localhost    # Report file is saved on the Ansible control node
+      delegate_to: localhost

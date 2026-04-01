@@ -1,71 +1,111 @@
 # =============================================================================
 # execute_upgrade.yml
-# Purpose : Set the boot variable to the new image, save configuration, and
-#           reload the device. Then wait for it to come back online.
-# Run order: 3 of 4  →  pre_upgrade_checks → stage_firmware → [HERE] → post_upgrade_verify
-# WARNING : This playbook causes a network outage on each device it targets.
-#           Always run with serial: 1 (one device at a time) and during a
-#           scheduled maintenance window.
+# Purpose : Set the boot image and reload the device. Platform detected
+#           automatically — IOS-XE and CBS use completely different commands.
+#
+# IOS-XE : 'boot system flash:<image>' → reload
+# CBS     : 'boot system image-list flash://system/images/<image>' → reload
+#           CBS may also require activating the image before reload
+#
+# WARNING : This playbook causes a network outage on each device.
+#           Always run during a maintenance window.
+# Run order: 3 of 4
 # =============================================================================
 ---
 - name: Execute firmware upgrade
   hosts: upgrade_candidates
   gather_facts: false
   connection: network_cli
-  serial: 1    # CRITICAL: reload one device at a time to limit blast radius
+  serial: 1    # CRITICAL: one device at a time
 
   tasks:
 
-    # -------------------------------------------------------------------------
-    # 1. Set boot variable
-    #    'no boot system' clears any existing boot statements first, ensuring
-    #    only the new image is booted. save_when: always writes to NVRAM.
-    # -------------------------------------------------------------------------
-    - name: Set boot variable to new firmware image
+    # =========================================================================
+    # PLATFORM DETECTION
+    # =========================================================================
+
+    - name: Get show version output
+      cisco.ios.ios_command:
+        commands:
+          - show version
+      register: version_output
+
+    - name: Detect platform type
+      ansible.builtin.set_fact:
+        platform: >-
+          {{ 'iosxe' if ('IOS XE' in version_output.stdout[0] or 'IOS-XE' in version_output.stdout[0])
+             else 'cbs' if ('CBS' in version_output.stdout[0] or 'Active-image' in version_output.stdout[0])
+             else 'unknown' }}
+
+    - name: Confirm platform before proceeding
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} — platform: {{ platform | upper }}. Proceeding with upgrade."
+
+    # =========================================================================
+    # SET BOOT IMAGE — IOS-XE
+    # =========================================================================
+
+    - name: Clear existing boot statements and set new image (IOS-XE)
       cisco.ios.ios_config:
         lines:
-          - "no boot system"                                      # Remove all existing boot statements
-          - "boot system flash:{{ firmware.target_image }}"       # Set new image as sole boot target
-        save_when: always    # Immediately writes startup-config — equivalent to 'write memory'
+          - "no boot system"
+          - "boot system flash:{{ firmware_target_image | default(firmware.target_image) }}"
+        save_when: always
+      when: platform == 'iosxe'
 
-    # -------------------------------------------------------------------------
-    # 2. Verify boot variable was accepted
-    #    'show boot' output must contain the target image filename.
-    #    If this assert fails, the reload is not attempted.
-    # -------------------------------------------------------------------------
-    - name: Confirm boot variable with 'show boot'
+    - name: Verify boot variable is set correctly (IOS-XE)
       cisco.ios.ios_command:
         commands:
           - show boot
       register: boot_check
+      when: platform == 'iosxe'
 
-    - name: Assert boot variable contains target image
+    - name: Assert boot variable contains target image (IOS-XE)
       ansible.builtin.assert:
         that:
-          - firmware.target_image in boot_check.stdout[0]
+          - firmware_target_image | default(firmware.target_image) in boot_check.stdout[0]
         fail_msg: >
           Boot variable NOT set correctly on {{ inventory_hostname }}.
-          Aborting reload — check 'show boot' manually.
+          Aborting — check 'show boot' manually.
         success_msg: "Boot variable confirmed on {{ inventory_hostname }}."
+      when: platform == 'iosxe'
 
-    # -------------------------------------------------------------------------
-    # 3. Final config save before reload
-    #    ios_config with save_when: always already saved, but an explicit
-    #    'write memory' here is a belt-and-suspenders safety measure.
-    # -------------------------------------------------------------------------
-    - name: Save running configuration (belt-and-suspenders before reload)
+    # =========================================================================
+    # SET BOOT IMAGE — CBS
+    # CBS uses a different boot command and may support 'boot system image-list'
+    # Some CBS models activate via 'firmware upgrade' or by setting next boot image
+    # =========================================================================
+
+    - name: Set next boot image (CBS)
+      cisco.ios.ios_config:
+        lines:
+          - "boot system image-list flash://system/images/{{ firmware_target_image | default(firmware.target_image) }}"
+        save_when: always
+      when: platform == 'cbs'
+      ignore_errors: true    # Command syntax varies between CBS models — see note below
+      register: cbs_boot_set
+
+    # Note: If 'boot system image-list' is not supported on your CBS model,
+    # the upgrade may need to be completed via the web UI or a different CLI
+    # command. Check your CBS model's admin guide for the correct command.
+    - name: Warn if CBS boot command may not have been accepted
+      ansible.builtin.debug:
+        msg: >
+          WARNING: 'boot system image-list' may not be supported on this CBS model.
+          If the reload does not boot the new image, set the active image manually
+          via the switch web UI (Administration > File Management > Active Image).
+      when: platform == 'cbs' and cbs_boot_set is failed
+
+    # =========================================================================
+    # SAVE CONFIG AND RELOAD — both platforms
+    # =========================================================================
+
+    - name: Save running configuration before reload
       cisco.ios.ios_command:
         commands:
           - write memory
 
-    # -------------------------------------------------------------------------
-    # 4. Reload the device
-    #    IOS may prompt "Save configuration? [yes/no]" and "Proceed with reload?"
-    #    Both prompts are answered 'y'. ignore_errors: true is required because
-    #    the SSH connection will drop as soon as the device begins reloading —
-    #    that disconnect looks like a task failure to Ansible.
-    # -------------------------------------------------------------------------
-    - name: Reload device to boot new firmware
+    - name: Reload device (IOS-XE)
       cisco.ios.ios_command:
         commands:
           - command: reload
@@ -76,33 +116,39 @@
               - "y"
               - "y"
       vars:
-        ansible_command_timeout: 30    # Short timeout — connection drops immediately on reload
-      ignore_errors: true              # Expected: SSH session is terminated by the reload
+        ansible_command_timeout: 30
+      ignore_errors: true    # SSH drops immediately on reload — this is expected
+      when: platform == 'iosxe'
 
-    # -------------------------------------------------------------------------
-    # 5. Wait for SSH to become available (device is rebooting)
-    #    delay: 120 gives the device time to start shutting down before we poll.
-    #    timeout: 600 allows up to 10 minutes for the full boot cycle.
-    #    Adjust timeout upward for chassis with many line cards.
-    # -------------------------------------------------------------------------
-    - name: Wait for device SSH port to reopen after reboot
+    - name: Reload device (CBS)
+      cisco.ios.ios_command:
+        commands:
+          - command: reload
+            prompt:
+              - "proceed"    # CBS: "Are you sure you want to proceed? [y/n]:"
+            answer:
+              - "y"
+      vars:
+        ansible_command_timeout: 30
+      ignore_errors: true    # SSH drops immediately on reload — this is expected
+      when: platform == 'cbs'
+
+    # =========================================================================
+    # WAIT FOR DEVICE TO RECOVER
+    # =========================================================================
+
+    - name: Wait for SSH port to reopen after reboot
       ansible.builtin.wait_for:
         host: "{{ ansible_host }}"
         port: 22
-        delay: 120      # Seconds to wait before first poll (device is still shutting down)
-        timeout: 600    # Maximum seconds to wait for SSH to come back (10 minutes)
+        delay: 120      # Wait 2 min before polling — device is still shutting down
+        timeout: 600    # Up to 10 min total wait
         state: started
-      delegate_to: localhost    # The wait loop runs on the control node, not the router
+      delegate_to: localhost
 
-    # -------------------------------------------------------------------------
-    # 6. Extra stabilisation pause
-    #    SSH becomes available before IOS fully initialises all processes,
-    #    routing protocols, and interfaces. This pause reduces false failures
-    #    in the post-upgrade verification playbook.
-    # -------------------------------------------------------------------------
-    - name: Allow device services and routing protocols to stabilise
+    - name: Allow services and routing protocols to stabilise
       ansible.builtin.pause:
         seconds: 60
         prompt: >
-          Waiting 60 s for {{ inventory_hostname }} to fully initialise
-          after reboot. Press Ctrl+C then A to abort if needed.
+          Waiting 60 s for {{ inventory_hostname }} to fully initialise.
+          Press Ctrl+C then A to abort if needed.

@@ -1,80 +1,157 @@
 # =============================================================================
 # stage_firmware.yml
-# Purpose : Copy the firmware image directly from this machine to each
-#           device's flash memory, then verify integrity with MD5.
-#           No external file server required — Ansible pushes the file
-#           over the existing SSH connection using net_put.
+# Purpose : Push the firmware image from this machine to each device's flash,
+#           then verify integrity. Platform detected automatically.
 #
-# Outputs : firmware image written to flash: on each device
-# Run order: 2 of 4  →  pre_upgrade_checks → [HERE] → execute_upgrade → post_upgrade_verify
+# IOS-XE : Image goes to flash:/image.bin
+#           MD5 verified with 'verify /md5 flash:<image>'
+# CBS     : Image goes to flash://system/images/image.bin
+#           MD5 is shown in 'show version' output — compared directly
 #
-# Note    : serial: 3 balances transfer speed against control-node bandwidth.
-#           If your uplink is limited, reduce to serial: 1.
-#           The .bin file path is passed in via firmware.local_bin_path,
-#           which upgrade_tool.py sets automatically from the file you selected.
+# Run order: 2 of 4
 # =============================================================================
 ---
 - name: Stage firmware images
   hosts: upgrade_candidates
   gather_facts: false
   connection: network_cli
-  serial: 3    # Push to 3 devices at a time — reduce if bandwidth is limited
+  serial: 3
 
   tasks:
 
-    # -------------------------------------------------------------------------
-    # 1. Idempotency check — skip the transfer if the image is already on flash
-    #    'dir flash:<file>' returns non-zero if the file is absent, so we
-    #    ignore_errors and branch on the result below.
-    # -------------------------------------------------------------------------
-    - name: Check whether target image already exists on flash
+    # =========================================================================
+    # PLATFORM DETECTION
+    # =========================================================================
+
+    - name: Get show version output
       cisco.ios.ios_command:
         commands:
-          - "dir flash:{{ firmware.target_image }}"
-      register: image_check
-      ignore_errors: true    # Expected to 'fail' when file is absent
+          - show version
+      register: version_output
 
-    - name: Inform operator — transfer will be skipped (image already present)
+    - name: Detect platform type
+      ansible.builtin.set_fact:
+        platform: >-
+          {{ 'iosxe' if ('IOS XE' in version_output.stdout[0] or 'IOS-XE' in version_output.stdout[0])
+             else 'cbs' if ('CBS' in version_output.stdout[0] or 'Active-image' in version_output.stdout[0])
+             else 'unknown' }}
+
+    # =========================================================================
+    # IDEMPOTENCY CHECK — skip transfer if image already present
+    # =========================================================================
+
+    # IOS-XE: image lives at flash:/image.bin
+    - name: Check if image already exists on flash (IOS-XE)
+      cisco.ios.ios_command:
+        commands:
+          - "dir flash:{{ firmware_target_image | default(firmware.target_image) }}"
+      register: image_check_iosxe
+      ignore_errors: true
+      when: platform == 'iosxe'
+
+    # CBS: image lives at flash://system/images/image.bin
+    - name: Check if image already exists on flash (CBS)
+      cisco.ios.ios_command:
+        commands:
+          - "dir flash://system/images/{{ firmware_target_image | default(firmware.target_image) }}"
+      register: image_check_cbs
+      ignore_errors: true
+      when: platform == 'cbs'
+
+    - name: Set image_exists flag
+      ansible.builtin.set_fact:
+        image_exists: >-
+          {{ (image_check_iosxe is succeeded and image_check_iosxe is not skipped)
+             if platform == 'iosxe'
+             else (image_check_cbs is succeeded and image_check_cbs is not skipped) }}
+
+    - name: Inform operator — image already on flash, skipping transfer
       ansible.builtin.debug:
-        msg: "{{ inventory_hostname }}: {{ firmware.target_image }} already on flash — skipping transfer."
-      when: image_check is succeeded
+        msg: >
+          {{ inventory_hostname }}: {{ firmware_target_image | default(firmware.target_image) }}
+          already on flash — skipping transfer.
+      when: image_exists
 
-    # -------------------------------------------------------------------------
-    # 2. Direct push from control node → device flash
-    #    ansible.netcommon.net_put copies a local file to the remote device
-    #    over the existing SSH/SCP connection — no separate file server needed.
-    #    ansible_command_timeout is extended to 45 min (2700 s) because an
-    #    850 MB file over a management-plane link can take a long time.
-    # -------------------------------------------------------------------------
-    - name: Push firmware image from this machine to device flash
+    # =========================================================================
+    # FILE TRANSFER — direct push from this machine over SSH
+    # =========================================================================
+
+    # IOS-XE destination: flash:/image.bin
+    - name: Push firmware image to device flash (IOS-XE)
       ansible.netcommon.net_put:
-        src:      "{{ firmware.local_bin_path }}"      # Full path on this machine
-        dest:     "flash:/{{ firmware.target_image }}" # Destination on device
-        protocol: scp                                  # Uses the existing SSH connection
-      when: image_check is failed
+        src:      "{{ firmware_local_bin_path }}"
+        dest:     "flash:/{{ firmware_target_image | default(firmware.target_image) }}"
+        protocol: scp
+      when: platform == 'iosxe' and not image_exists
       vars:
-        ansible_command_timeout: 2700    # 45-minute timeout — adjust for slow links
+        ansible_command_timeout: 2700
 
-    # -------------------------------------------------------------------------
-    # 3. MD5 verification — confirms the image was not corrupted in transit
-    #    The device calculates MD5 locally; this can take several minutes for
-    #    large images. Result is compared against firmware.target_md5.
-    # -------------------------------------------------------------------------
-    - name: Calculate MD5 hash of image on flash
+    # CBS destination: flash://system/images/image.bin
+    - name: Push firmware image to device flash (CBS)
+      ansible.netcommon.net_put:
+        src:      "{{ firmware_local_bin_path }}"
+        dest:     "flash://system/images/{{ firmware_target_image | default(firmware.target_image) }}"
+        protocol: scp
+      when: platform == 'cbs' and not image_exists
+      vars:
+        ansible_command_timeout: 2700
+
+    # =========================================================================
+    # MD5 VERIFICATION — platform specific
+    # =========================================================================
+
+    # IOS-XE: 'verify /md5 flash:<image>' calculates and returns the hash
+    - name: Verify MD5 of transferred image (IOS-XE)
       cisco.ios.ios_command:
         commands:
-          - "verify /md5 flash:{{ firmware.target_image }}"
-      register: md5_result
+          - "verify /md5 flash:{{ firmware_target_image | default(firmware.target_image) }}"
+      register: md5_iosxe
+      when: platform == 'iosxe'
       vars:
-        ansible_command_timeout: 600    # 10-minute timeout for MD5 on large files
+        ansible_command_timeout: 600
 
-    - name: Assert MD5 hash matches expected value
+    - name: Assert MD5 matches (IOS-XE)
       ansible.builtin.assert:
         that:
-          - firmware.target_md5 in md5_result.stdout[0]
+          - firmware_target_md5 | default(firmware.target_md5) in md5_iosxe.stdout[0]
         fail_msg: >
-          MD5 MISMATCH on {{ inventory_hostname }} for {{ firmware.target_image }}.
-          Expected: {{ firmware.target_md5 }}.
-          DO NOT proceed — delete the corrupt image with 'del flash:{{ firmware.target_image }}'
-          and re-run the staging phase.
-        success_msg: "MD5 verified on {{ inventory_hostname }} — image integrity confirmed."
+          MD5 MISMATCH on {{ inventory_hostname }}.
+          Expected: {{ firmware_target_md5 | default(firmware.target_md5) }}.
+          DO NOT proceed — delete the image and re-run staging.
+        success_msg: "MD5 verified on {{ inventory_hostname }}."
+      when: platform == 'iosxe'
+
+    # CBS: MD5 is shown in 'show version' under the image entry — read it directly
+    - name: Read MD5 from show version after transfer (CBS)
+      cisco.ios.ios_command:
+        commands:
+          - show version
+      register: version_after_transfer
+      when: platform == 'cbs'
+
+    - name: Extract inactive image MD5 from show version (CBS)
+      ansible.builtin.set_fact:
+        cbs_image_md5: >-
+          {{ version_after_transfer.stdout[0]
+             | regex_search('Inactive-image:.*\n.*\n\s+MD5 Digest:\s+(\S+)', '\1')
+             | first | default('') }}
+      when: platform == 'cbs'
+
+    - name: Assert MD5 matches (CBS)
+      ansible.builtin.assert:
+        that:
+          - firmware_target_md5 | default(firmware.target_md5) == cbs_image_md5
+        fail_msg: >
+          MD5 MISMATCH on {{ inventory_hostname }}.
+          Expected: {{ firmware_target_md5 | default(firmware.target_md5) }}.
+          Got: {{ cbs_image_md5 }}.
+          DO NOT proceed — delete the image and re-run staging.
+        success_msg: "MD5 verified on {{ inventory_hostname }}."
+      when: platform == 'cbs' and cbs_image_md5 | length > 0
+
+    - name: Warn if CBS MD5 could not be read from show version
+      ansible.builtin.debug:
+        msg: >
+          WARNING: Could not read MD5 from show version on {{ inventory_hostname }}.
+          Verify the image manually before proceeding to upgrade.
+      when: platform == 'cbs' and (cbs_image_md5 is not defined or cbs_image_md5 | length == 0)
