@@ -36,6 +36,13 @@
              else 'cbs' if ('CBS' in version_output.stdout[0] or 'Active-image' in version_output.stdout[0])
              else 'unknown' }}
 
+    # Skip this entire phase if pre-checks determined no upgrade is needed.
+    # needs_upgrade is set by pre_upgrade_checks.yml — if that phase was not
+    # run in the same session, default to true so staging proceeds.
+    - name: Skip host — already on target version
+      ansible.builtin.meta: end_host
+      when: not (needs_upgrade | default(true) | bool)
+
     # =========================================================================
     # IDEMPOTENCY CHECK — skip transfer if image already present
     # =========================================================================
@@ -121,37 +128,43 @@
         success_msg: "MD5 verified on {{ inventory_hostname }}."
       when: platform == 'iosxe'
 
-    # CBS: MD5 is shown in 'show version' under the image entry — read it directly
-    - name: Read MD5 from show version after transfer (CBS)
+    # CBS: 'show version' lists every image with its MD5 Digest.
+    # We search for the block that contains the target filename and extract
+    # the MD5 from that block — regardless of whether it is Active or Inactive.
+    # This handles both the case where the image was just uploaded (inactive)
+    # and the case where it is already the running image (active).
+    - name: Read image list from show version (CBS)
       cisco.ios.ios_command:
         commands:
           - show version
       register: version_after_transfer
       when: platform == 'cbs'
 
-    - name: Extract inactive image MD5 from show version (CBS)
+    - name: Extract MD5 for target image from show version (CBS)
       ansible.builtin.set_fact:
         cbs_image_md5: >-
           {{ version_after_transfer.stdout[0]
-             | regex_search('Inactive-image:.*\n.*\n\s+MD5 Digest:\s+(\S+)', '\1')
+             | regex_search(firmware_target_image | default(firmware.target_image)
+               + r'.*\n\s+Version:.*\n\s+MD5 Digest:\s+(\S+)', '\1')
              | first | default('') }}
       when: platform == 'cbs'
 
-    - name: Assert MD5 matches (CBS)
+    - name: Assert MD5 matches target image (CBS)
       ansible.builtin.assert:
         that:
           - firmware_target_md5 | default(firmware.target_md5) == cbs_image_md5
         fail_msg: >
           MD5 MISMATCH on {{ inventory_hostname }}.
-          Expected: {{ firmware_target_md5 | default(firmware.target_md5) }}.
-          Got: {{ cbs_image_md5 }}.
+          Expected : {{ firmware_target_md5 | default(firmware.target_md5) }}.
+          Got       : {{ cbs_image_md5 }}.
           DO NOT proceed — delete the image and re-run staging.
-        success_msg: "MD5 verified on {{ inventory_hostname }}."
+        success_msg: "MD5 verified on {{ inventory_hostname }} — image integrity confirmed."
       when: platform == 'cbs' and cbs_image_md5 | length > 0
 
     - name: Warn if CBS MD5 could not be read from show version
       ansible.builtin.debug:
         msg: >
-          WARNING: Could not read MD5 from show version on {{ inventory_hostname }}.
+          WARNING: Could not read MD5 for {{ firmware_target_image | default(firmware.target_image) }}
+          from show version on {{ inventory_hostname }}.
           Verify the image manually before proceeding to upgrade.
       when: platform == 'cbs' and (cbs_image_md5 is not defined or cbs_image_md5 | length == 0)

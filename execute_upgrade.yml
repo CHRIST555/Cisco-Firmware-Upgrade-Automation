@@ -37,6 +37,11 @@
              else 'cbs' if ('CBS' in version_output.stdout[0] or 'Active-image' in version_output.stdout[0])
              else 'unknown' }}
 
+    # Skip this entire phase if pre-checks determined no upgrade is needed
+    - name: Skip host — already on target version
+      ansible.builtin.meta: end_host
+      when: not (needs_upgrade | default(true) | bool)
+
     - name: Confirm platform before proceeding
       ansible.builtin.debug:
         msg: "{{ inventory_hostname }} — platform: {{ platform | upper }}. Proceeding with upgrade."

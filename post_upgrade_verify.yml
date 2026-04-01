@@ -30,6 +30,11 @@
              else 'cbs' if ('CBS' in post_version.stdout[0] or 'Active-image' in post_version.stdout[0])
              else 'unknown' }}
 
+    # Skip this entire phase if pre-checks determined no upgrade is needed
+    - name: Skip host — already on target version
+      ansible.builtin.meta: end_host
+      when: not (needs_upgrade | default(true) | bool)
+
     # =========================================================================
     # VERSION VERIFICATION
     # =========================================================================

@@ -73,9 +73,22 @@
       ansible.builtin.debug:
         msg: "{{ inventory_hostname }} is currently running {{ current_version }}."
 
-    - name: Skip host if already on target version
+    # Set needs_upgrade fact — used by ALL subsequent phases to skip this host
+    # if it is already running the target version.
+    - name: Record whether this host needs an upgrade
+      ansible.builtin.set_fact:
+        needs_upgrade: "{{ current_version != firmware_target_version | default(firmware.target_version) }}"
+
+    - name: Inform operator — device already on target version, will be skipped
+      ansible.builtin.debug:
+        msg: >
+          {{ inventory_hostname }} is already running
+          {{ firmware_target_version | default(firmware.target_version) }} — skipping all phases.
+      when: not needs_upgrade
+
+    - name: Skip remaining pre-checks for this host (already up to date)
       ansible.builtin.meta: end_host
-      when: current_version == firmware_target_version | default(firmware.target_version)
+      when: not needs_upgrade
 
     - name: Confirm upgrade is needed
       ansible.builtin.debug:
