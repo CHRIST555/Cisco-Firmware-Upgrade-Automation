@@ -128,14 +128,14 @@ The `.md5` file is on the same Cisco download page as the `.bin`. Downloading bo
 **3. Run the launcher**
 
 ```bash
-python3 upgrade_tool.py
+python upgrade_tool.py
 ```
 
 ---
 
 ## Using the Launcher
 
-Run `python3 upgrade_tool.py` and follow the prompts. No flags or arguments needed.
+Run `python upgrade_tool.py` and follow the prompts. No flags or arguments needed.
 
 ### Step 1 — Firmware image
 

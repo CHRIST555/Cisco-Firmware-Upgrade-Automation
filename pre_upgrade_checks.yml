@@ -90,6 +90,7 @@
       ansible.builtin.copy:
         content: |
           host={{ inventory_hostname }}
+          ip={{ ansible_host }}
           platform={{ platform }}
           status=UP_TO_DATE
           current_version={{ current_version }}
@@ -189,35 +190,26 @@
           {{ (match | first) if (match and match | length > 0) else '0' }}
       when: platform == 'iosxe' and cpu_iosxe is succeeded
 
-    # CBS: 'show process cpu' — format differs, extract utilization percentage
-    - name: Check CPU utilisation (CBS)
-      cisco.ios.ios_command:
-        commands:
-          - show process cpu
-      register: cpu_cbs
-      when: platform == 'cbs'
-      ignore_errors: true
-
-    - name: Parse CPU usage (CBS)
+    # CBS does not support 'show process cpu' — skip the check entirely.
+    - name: Skip CPU check on CBS (command not supported)
       ansible.builtin.set_fact:
-        cpu_usage: >-
-          {% set match = cpu_cbs.stdout[0] | regex_search('(\d+)%', '\1') %}
-          {{ (match | first) if (match and match | length > 0) else '0' }}
-      when: platform == 'cbs' and cpu_cbs is succeeded
+        cpu_usage: "0"
+      when: platform == 'cbs'
 
     - name: Set cpu_usage to 0 if check failed
       ansible.builtin.set_fact:
         cpu_usage: "0"
       when: cpu_usage is not defined
 
-    - name: Warn if CPU check returned no data
+    - name: Inform operator CPU check was skipped
       ansible.builtin.debug:
         msg: >
-          WARNING: Could not check CPU on {{ inventory_hostname }}.
-          Verify device is not under heavy load before proceeding.
+          INFO: CPU check skipped on {{ inventory_hostname }}
+          ({{ platform | upper }} does not support automated CPU checks).
+          Verify the device is not under heavy load before proceeding.
       when: cpu_usage == "0"
 
-    - name: Assert CPU within threshold
+    - name: Assert CPU within threshold (IOS-XE only)
       ansible.builtin.assert:
         that:
           - cpu_usage | int < firmware.cpu_threshold
@@ -260,6 +252,7 @@
       ansible.builtin.copy:
         content: |
           host={{ inventory_hostname }}
+          ip={{ ansible_host }}
           platform={{ platform }}
           status=READY
           current_version={{ current_version }}

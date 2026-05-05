@@ -540,31 +540,42 @@ def print_summary(devices, phase_idx):
 
     rows = []
     for device in devices:
-        # Try alias first, then IP-derived name, then any file containing the IP
-        status_file = status_dir / f"{device['alias']}.status"
-        if not status_file.exists():
-            alt = "device-" + device['ip'].replace(".", "-")
-            status_file = status_dir / f"{alt}.status"
-        if not status_file.exists():
-            # Last resort — scan all status files for one matching this IP
-            for sf in status_dir.glob("*.status"):
-                if device['ip'] in sf.read_text():
-                    status_file = sf
-                    break
+        # Status files are named by Ansible hostname (alias) or IP-derived name.
+        # Try multiple options to find the right file.
+        status_file = None
+        candidates = [
+            status_dir / f"{device['alias']}.status",
+            status_dir / ("device-" + device['ip'].replace(".", "-") + ".status"),
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                status_file = candidate
+                break
+        if not status_file:
+            # Scan all status files for one that contains this device's IP
+            for sf in sorted(status_dir.glob("*.status")):
+                try:
+                    if device['ip'] in sf.read_text():
+                        status_file = sf
+                        break
+                except Exception:
+                    pass
 
-        if status_file.exists():
+        if status_file and status_file.exists():
             data = {}
             for line in status_file.read_text().strip().splitlines():
                 if "=" in line:
                     k, v = line.split("=", 1)
                     data[k.strip()] = v.strip()
-            status  = data.get("status", "UNKNOWN")
+            status   = data.get("status", "UNKNOWN")
             platform = data.get("platform", "?").upper()
             version  = data.get("current_version", data.get("target_version", "?"))
         else:
             status   = "NO_STATUS"
             platform = "?"
             version  = "?"
+            warn(f"No status file found for {device['alias']} ({device['ip']}) "
+                 f"— did pre-checks run?")
 
         colour, label = STATUS_LABELS.get(status, (DIM, f"? {status}"))
         rows.append((device["alias"], device["ip"], platform, colour, label, version))

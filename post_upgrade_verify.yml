@@ -124,6 +124,7 @@
       ansible.builtin.copy:
         content: |
           host={{ inventory_hostname }}
+          ip={{ ansible_host }}
           platform={{ platform }}
           status={{ 'COMPLETE' if new_version == firmware_target_version | default(firmware.target_version) else 'FAILED' }}
           previous_version={{ hostvars[inventory_hostname].current_version | default('unknown') }}
