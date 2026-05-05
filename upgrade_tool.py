@@ -540,11 +540,17 @@ def print_summary(devices, phase_idx):
 
     rows = []
     for device in devices:
+        # Try alias first, then IP-derived name, then any file containing the IP
         status_file = status_dir / f"{device['alias']}.status"
         if not status_file.exists():
-            # Try by IP-derived name
             alt = "device-" + device['ip'].replace(".", "-")
             status_file = status_dir / f"{alt}.status"
+        if not status_file.exists():
+            # Last resort — scan all status files for one matching this IP
+            for sf in status_dir.glob("*.status"):
+                if device['ip'] in sf.read_text():
+                    status_file = sf
+                    break
 
         if status_file.exists():
             data = {}
