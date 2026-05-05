@@ -128,7 +128,7 @@ The `.md5` file is on the same Cisco download page as the `.bin`. Downloading bo
 **3. Run the launcher**
 
 ```bash
-python upgrade_tool.py
+python3 upgrade_tool.py
 ```
 
 ---
