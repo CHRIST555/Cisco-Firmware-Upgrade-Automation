@@ -135,7 +135,7 @@ python upgrade_tool.py
 
 ## Using the Launcher
 
-Run `python upgrade_tool.py` and follow the prompts. No flags or arguments needed.
+Run `python3 upgrade_tool.py` and follow the prompts. No flags or arguments needed.
 
 ### Step 1 — Firmware image
 
