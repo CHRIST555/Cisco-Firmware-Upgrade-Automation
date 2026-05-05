@@ -86,6 +86,18 @@
           {{ firmware_target_version | default(firmware.target_version) }} — skipping all phases.
       when: not needs_upgrade
 
+    - name: Write status — already up to date
+      ansible.builtin.copy:
+        content: |
+          host={{ inventory_hostname }}
+          platform={{ platform }}
+          status=UP_TO_DATE
+          current_version={{ current_version }}
+          target_version={{ firmware_target_version | default(firmware.target_version) }}
+        dest: "reports/status/{{ inventory_hostname }}.status"
+      delegate_to: localhost
+      when: not needs_upgrade
+
     - name: Skip remaining pre-checks for this host (already up to date)
       ansible.builtin.meta: end_host
       when: not needs_upgrade
@@ -244,4 +256,16 @@
           cpu_5min_pct:    {{ cpu_usage }}
           timestamp:       {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}
         dest: "reports/pre-upgrade/{{ inventory_hostname }}.yml"
+      delegate_to: localhost
+
+    # Write status file — read by upgrade_tool.py to build the summary table
+    - name: Write status — checks passed, ready for upgrade
+      ansible.builtin.copy:
+        content: |
+          host={{ inventory_hostname }}
+          platform={{ platform }}
+          status=READY
+          current_version={{ current_version }}
+          target_version={{ firmware_target_version | default(firmware.target_version) }}
+        dest: "reports/status/{{ inventory_hostname }}.status"
       delegate_to: localhost

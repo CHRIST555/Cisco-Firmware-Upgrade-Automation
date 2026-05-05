@@ -431,6 +431,7 @@ def ensure_directories():
         "backups/pre-upgrade",
         "reports/pre-upgrade",
         "reports/post-upgrade",
+        "reports/status",
         "group_vars/ios_routers",
         "inventory",
     ]
@@ -513,6 +514,98 @@ def show_summary(phase_idx, username, key_path, firmware_path, target_version, t
     print(c(wrapped, BOLD))
     print()
 
+# ── Post-run summary ─────────────────────────────────────────────────────────
+
+def print_summary(devices, phase_idx):
+    """
+    Read status files written by the playbooks and print a summary table.
+    Each playbook writes reports/status/<host>.status with key=value pairs.
+    """
+    # Only show summary for phases that produce status files
+    _, _, tags = PHASES[phase_idx]
+    # Always show — even partial runs write status files
+    status_dir = Path("reports/status")
+    if not status_dir.exists():
+        return
+
+    section("Upgrade Summary")
+
+    STATUS_LABELS = {
+        "UP_TO_DATE": (GREEN,  "✔ Already up to date"),
+        "READY":      (CYAN,   "✔ Pre-checks passed"),
+        "STAGED":     (YELLOW, "✔ Image staged — reboot required"),
+        "COMPLETE":   (GREEN,  "✔ Upgrade complete"),
+        "FAILED":     (RED,    "✖ FAILED"),
+    }
+
+    rows = []
+    for device in devices:
+        status_file = status_dir / f"{device['alias']}.status"
+        if not status_file.exists():
+            # Try by IP-derived name
+            alt = "device-" + device['ip'].replace(".", "-")
+            status_file = status_dir / f"{alt}.status"
+
+        if status_file.exists():
+            data = {}
+            for line in status_file.read_text().strip().splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    data[k.strip()] = v.strip()
+            status  = data.get("status", "UNKNOWN")
+            platform = data.get("platform", "?").upper()
+            version  = data.get("current_version", data.get("target_version", "?"))
+        else:
+            status   = "NO_STATUS"
+            platform = "?"
+            version  = "?"
+
+        colour, label = STATUS_LABELS.get(status, (DIM, f"? {status}"))
+        rows.append((device["alias"], device["ip"], platform, colour, label, version))
+
+    # Column widths
+    alias_w = max(len(r[0]) for r in rows) + 2
+    ip_w    = max(len(r[1]) for r in rows) + 2
+    plat_w  = 8
+
+    # Header
+    print(f"  {c('Device', BOLD):<{alias_w+10}} {c('IP', BOLD):<{ip_w+10}} {c('Platform', BOLD):<{plat_w+10}} {c('Status', BOLD)}")
+    print(c("  " + "─" * 75, DIM))
+
+    needs_reboot = []
+    failed       = []
+
+    for alias, ip, platform, colour, label, version in rows:
+        version_str = c(f"({version})", DIM)
+        print(f"  {c(alias, BOLD):<{alias_w+10}} {ip:<{ip_w+10}} {c(platform, DIM):<{plat_w+10}} {c(label, colour)} {version_str}")
+        if "staged" in label.lower():
+            needs_reboot.append(alias)
+        if "FAILED" in label:
+            failed.append(alias)
+
+    print()
+
+    # Highlight anything needing attention
+    if needs_reboot:
+        print(c("  ⚠  Reboot required on:", YELLOW))
+        for h in needs_reboot:
+            print(c(f"     • {h}", YELLOW))
+        print()
+        info("Run Phase 3 during your maintenance window to apply the upgrade.")
+
+    if failed:
+        print(c("  ✖  Failed devices:", RED))
+        for h in failed:
+            print(c(f"     • {h}", RED))
+        print()
+        info("Check reports/post-upgrade/ for details on each failure.")
+
+    if not needs_reboot and not failed:
+        success("All devices processed successfully.")
+
+    print()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -576,7 +669,8 @@ def main():
         if os.path.exists(dynamic_inv):
             os.unlink(dynamic_inv)
 
-    print()
+    # Print summary table regardless of whether Ansible succeeded or failed
+    print_summary(devices, phase_idx)
 
 if __name__ == "__main__":
     main()

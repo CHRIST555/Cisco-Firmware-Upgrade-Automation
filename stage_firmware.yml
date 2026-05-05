@@ -168,3 +168,14 @@
           from show version on {{ inventory_hostname }}.
           Verify the image manually before proceeding to upgrade.
       when: platform == 'cbs' and (cbs_image_md5 is not defined or cbs_image_md5 | length == 0)
+
+    # Write status — image is staged and verified, reboot required
+    - name: Write status — image staged, reboot required
+      ansible.builtin.copy:
+        content: |
+          host={{ inventory_hostname }}
+          platform={{ platform }}
+          status=STAGED
+          target_version={{ firmware_target_version | default(firmware.target_version) }}
+        dest: "reports/status/{{ inventory_hostname }}.status"
+      delegate_to: localhost

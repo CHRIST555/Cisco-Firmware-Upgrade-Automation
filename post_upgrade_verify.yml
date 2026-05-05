@@ -119,6 +119,19 @@
     # UPGRADE REPORT
     # =========================================================================
 
+    # Write status file for upgrade_tool.py summary
+    - name: Write status — upgrade complete
+      ansible.builtin.copy:
+        content: |
+          host={{ inventory_hostname }}
+          platform={{ platform }}
+          status={{ 'COMPLETE' if new_version == firmware_target_version | default(firmware.target_version) else 'FAILED' }}
+          previous_version={{ hostvars[inventory_hostname].current_version | default('unknown') }}
+          current_version={{ new_version }}
+          target_version={{ firmware_target_version | default(firmware.target_version) }}
+        dest: "reports/status/{{ inventory_hostname }}.status"
+      delegate_to: localhost
+
     - name: Write upgrade report to control node
       ansible.builtin.copy:
         content: |
