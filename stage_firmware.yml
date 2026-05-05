@@ -140,13 +140,28 @@
       register: version_after_transfer
       when: platform == 'cbs'
 
+    # Split the show version output into lines and find the MD5 that belongs
+    # to the target image. The CBS output looks like:
+#   Active-image: flash://system/images/<image>.bin
+#     Version: X.X.X.X
+#     MD5 Digest: <hash>
+    # We scan line by line: once we see the target filename, the next
+    # MD5 Digest line belongs to that image.
     - name: Extract MD5 for target image from show version (CBS)
       ansible.builtin.set_fact:
-        cbs_image_md5: >-
-          {{ version_after_transfer.stdout[0]
-             | regex_search(firmware_target_image | default(firmware.target_image)
-               + r'.*\n\s+Version:.*\n\s+MD5 Digest:\s+(\S+)', '\1')
-             | first | default('') }}
+        cbs_image_md5: |-
+          {% set target = firmware_target_image | default(firmware.target_image) %}
+          {% set lines = version_after_transfer.stdout[0].splitlines() %}
+          {% set found = namespace(image=false, md5='') %}
+          {% for line in lines %}
+            {% if target in line %}
+              {% set found.image = true %}
+            {% endif %}
+            {% if found.image and 'MD5 Digest' in line and found.md5 == '' %}
+              {% set found.md5 = line.split(':')[-1].strip() %}
+            {% endif %}
+          {% endfor %}
+          {{ found.md5 }}
       when: platform == 'cbs'
 
     - name: Assert MD5 matches target image (CBS)
