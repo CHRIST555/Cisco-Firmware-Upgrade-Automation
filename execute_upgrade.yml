@@ -1,14 +1,16 @@
 # =============================================================================
 # execute_upgrade.yml
-# Purpose : Set the boot image and reload the device. Platform detected
-#           automatically — IOS-XE and CBS use completely different commands.
+# Purpose : Activate the new firmware and reload the device.
+#           Platform detected automatically.
 #
-# IOS-XE : 'boot system flash:<image>' → reload
-# CBS     : 'boot system image-list flash://system/images/<image>' → reload
-#           CBS may also require activating the image before reload
+# IOS-XE : Sets 'boot system flash:<image>', saves config, reloads
+# CBS     : Runs 'boot system inactive-image' to swap active/inactive,
+#           saves config, reloads. New image must already be in inactive
+#           slot (done by Phase 2 - stage_firmware.yml)
 #
-# WARNING : This playbook causes a network outage on each device.
-#           Always run during a maintenance window.
+# WARNING : This playbook reboots devices. Always run during a maintenance
+#           window. serial: 1 ensures only one device reboots at a time.
+#
 # Run order: 3 of 4
 # =============================================================================
 ---
@@ -16,7 +18,7 @@
   hosts: upgrade_candidates
   gather_facts: false
   connection: network_cli
-  serial: 1    # CRITICAL: one device at a time
+  serial: 1
 
   tasks:
 
@@ -37,12 +39,12 @@
              else 'cbs' if ('CBS' in version_output.stdout[0] or 'Active-image' in version_output.stdout[0])
              else 'unknown' }}
 
-    # Skip this entire phase if pre-checks determined no upgrade is needed
+    # Skip if already on target version
     - name: Skip host — already on target version
       ansible.builtin.meta: end_host
       when: not (needs_upgrade | default(true) | bool)
 
-    - name: Confirm platform before proceeding
+    - name: Confirm platform and proceeding with upgrade
       ansible.builtin.debug:
         msg: "{{ inventory_hostname }} — platform: {{ platform | upper }}. Proceeding with upgrade."
 
@@ -77,32 +79,44 @@
 
     # =========================================================================
     # SET BOOT IMAGE — CBS
-    # CBS uses a different boot command and may support 'boot system image-list'
-    # Some CBS models activate via 'firmware upgrade' or by setting next boot image
+    # 'boot system inactive-image' swaps the active and inactive image slots.
+    # The new firmware must already be in the inactive slot (Phase 2).
     # =========================================================================
 
-    - name: Set next boot image (CBS)
-      cisco.ios.ios_config:
-        lines:
-          - "boot system image-list flash://system/images/{{ firmware_target_image | default(firmware.target_image) }}"
-        save_when: always
+    - name: Confirm target image is in bootvar before swapping (CBS)
+      cisco.ios.ios_command:
+        commands:
+          - show bootvar
+      register: cbs_bootvar
       when: platform == 'cbs'
-      ignore_errors: true    # Command syntax varies between CBS models — see note below
-      register: cbs_boot_set
 
-    # Note: If 'boot system image-list' is not supported on your CBS model,
-    # the upgrade may need to be completed via the web UI or a different CLI
-    # command. Check your CBS model's admin guide for the correct command.
-    - name: Warn if CBS boot command may not have been accepted
+    - name: Assert target image is present in bootvar (CBS)
+      ansible.builtin.assert:
+        that:
+          - firmware_target_image | default(firmware.target_image)
+            in cbs_bootvar.stdout[0]
+        fail_msg: >
+          Target image {{ firmware_target_image | default(firmware.target_image) }}
+          not found in show bootvar on {{ inventory_hostname }}.
+          Run Phase 2 (stage firmware) before attempting upgrade.
+        success_msg: "Target image confirmed in bootvar — ready to swap."
+      when: platform == 'cbs'
+
+    - name: Swap inactive image to active (CBS)
+      cisco.ios.ios_command:
+        commands:
+          - boot system inactive-image
+      when: platform == 'cbs'
+
+    - name: Confirm boot swap accepted (CBS)
       ansible.builtin.debug:
         msg: >
-          WARNING: 'boot system image-list' may not be supported on this CBS model.
-          If the reload does not boot the new image, set the active image manually
-          via the switch web UI (Administration > File Management > Active Image).
-      when: platform == 'cbs' and cbs_boot_set is failed
+          {{ inventory_hostname }}: 'boot system inactive-image' accepted.
+          Device will boot new firmware after reload.
+      when: platform == 'cbs'
 
     # =========================================================================
-    # SAVE CONFIG AND RELOAD — both platforms
+    # SAVE CONFIG AND RELOAD
     # =========================================================================
 
     - name: Save running configuration before reload
@@ -115,14 +129,14 @@
         commands:
           - command: reload
             prompt:
-              - "Save"       # "Save configuration? [yes/no]:"
-              - "confirm"    # "Proceed with reload? [confirm]"
+              - "Save"
+              - "confirm"
             answer:
               - "y"
               - "y"
       vars:
         ansible_command_timeout: 30
-      ignore_errors: true    # SSH drops immediately on reload — this is expected
+      ignore_errors: true
       when: platform == 'iosxe'
 
     - name: Reload device (CBS)
@@ -130,12 +144,12 @@
         commands:
           - command: reload
             prompt:
-              - "proceed"    # CBS: "Are you sure you want to proceed? [y/n]:"
+              - "proceed"
             answer:
               - "y"
       vars:
         ansible_command_timeout: 30
-      ignore_errors: true    # SSH drops immediately on reload — this is expected
+      ignore_errors: true
       when: platform == 'cbs'
 
     # =========================================================================
@@ -144,16 +158,16 @@
 
     - name: Wait for SSH port to reopen after reboot
       ansible.builtin.wait_for:
-        host: "{{ ansible_host }}"
-        port: 22
-        delay: 120      # Wait 2 min before polling — device is still shutting down
-        timeout: 600    # Up to 10 min total wait
-        state: started
+        host:    "{{ ansible_host }}"
+        port:    22
+        delay:   120
+        timeout: 600
+        state:   started
       delegate_to: localhost
 
-    - name: Allow services and routing protocols to stabilise
+    - name: Allow services to stabilise after reboot
       ansible.builtin.pause:
         seconds: 60
         prompt: >
           Waiting 60 s for {{ inventory_hostname }} to fully initialise.
-          Press Ctrl+C then A to abort if needed.
+          Press Ctrl+C then C to continue early, or A to abort.
