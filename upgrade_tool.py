@@ -427,6 +427,7 @@ def collect_run_options():
 
 def ensure_directories():
     """Create all directories the playbooks write output to."""
+    script_dir = Path(__file__).parent.resolve()
     required = [
         "backups/pre-upgrade",
         "reports/pre-upgrade",
@@ -437,9 +438,10 @@ def ensure_directories():
     ]
     created = []
     for d in required:
-        if not os.path.exists(d):
-            os.makedirs(d)
-            created.append(d)
+        full_path = script_dir / d
+        if not full_path.exists():
+            full_path.mkdir(parents=True, exist_ok=True)
+            created.append(str(full_path))
     if created:
         section("Creating Output Directories")
         for d in created:
@@ -524,8 +526,12 @@ def print_summary(devices, phase_idx):
     # Only show summary for phases that produce status files
     _, _, tags = PHASES[phase_idx]
     # Always show — even partial runs write status files
-    status_dir = Path("reports/status")
+    # Resolve relative to the script location so it works regardless
+    # of which directory the user runs the tool from
+    script_dir = Path(__file__).parent.resolve()
+    status_dir = script_dir / "reports" / "status"
     if not status_dir.exists():
+        warn("No status directory found — pre-checks may not have run yet.")
         return
 
     section("Upgrade Summary")
