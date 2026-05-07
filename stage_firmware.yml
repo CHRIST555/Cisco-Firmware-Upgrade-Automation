@@ -1,12 +1,15 @@
 # =============================================================================
 # stage_firmware.yml
-# Purpose : Push the firmware image from this machine to each device's flash,
-#           then confirm the image is present. Platform detected automatically.
+# Purpose : Push the firmware image to each device's flash.
+#           Platform detected automatically.
 #
-# IOS-XE : Uploads to flash:/<image>, verified with 'verify /md5'
-# CBS     : Reads inactive image path from 'show bootvar', uploads there.
-#           CBS uses a two-slot system — new image always goes to inactive slot.
-#           'boot system inactive-image' (Phase 3) then swaps them on reload.
+# IOS-XE : Pushes directly via SCP using net_put (flash:/<image>)
+#           Verifies with 'verify /md5'
+#
+# CBS     : upgrade_tool.py starts a temporary TFTP server on this machine.
+#           Ansible tells the CBS switch to pull the file via TFTP.
+#           CBS always writes to the inactive image slot (image1.bin).
+#           Uses variables: tftp_server_ip, tftp_server_port, tftp_filename
 #
 # Run order: 2 of 4
 # =============================================================================
@@ -36,16 +39,17 @@
              else 'cbs' if ('CBS' in version_output.stdout[0] or 'Active-image' in version_output.stdout[0])
              else 'unknown' }}
 
-    # Skip if pre-checks already determined this host is up to date
+    # Skip if already on target version
     - name: Skip host — already on target version
       ansible.builtin.meta: end_host
       when: not (needs_upgrade | default(true) | bool)
 
     # =========================================================================
-    # IDEMPOTENCY CHECK — skip transfer if image already staged
+    # IDEMPOTENCY CHECK
+    # IOS-XE: check if file exists on flash
+    # CBS: check if target is already the active image — if so skip entirely
     # =========================================================================
 
-    # IOS-XE: check if file already exists on flash
     - name: Check if image already exists on flash (IOS-XE)
       cisco.ios.ios_command:
         commands:
@@ -54,8 +58,6 @@
       ignore_errors: true
       when: platform == 'iosxe'
 
-    # CBS: check show bootvar — if target image name appears anywhere
-    # (active or inactive), it is already on the switch
     - name: Check bootvar for target image (CBS)
       cisco.ios.ios_command:
         commands:
@@ -64,13 +66,24 @@
       ignore_errors: true
       when: platform == 'cbs'
 
-    - name: Set image_exists flag
+    - name: Set image_exists flag (IOS-XE)
       ansible.builtin.set_fact:
-        image_exists: >-
-          {{ (image_check_iosxe is succeeded and image_check_iosxe is not skipped)
-             if platform == 'iosxe'
-             else (firmware_target_image | default(firmware.target_image)
-                   in image_check_cbs.stdout[0]) }}
+        image_exists: "{{ image_check_iosxe is succeeded and image_check_iosxe is not skipped }}"
+      when: platform == 'iosxe'
+
+    # For CBS: skip the transfer only if the device is already RUNNING
+    # the target version (caught by pre-checks and needs_upgrade=false).
+    # We never skip based on bootvar contents since 'boot system tftp://'
+    # needs to run to properly stage the image for the next reload.
+    - name: Set image_exists flag (CBS)
+      ansible.builtin.set_fact:
+        image_exists: false
+      when: platform == 'cbs'
+
+    - name: Ensure image_exists is defined
+      ansible.builtin.set_fact:
+        image_exists: false
+      when: image_exists is not defined
 
     - name: Inform operator — image already present, skipping transfer
       ansible.builtin.debug:
@@ -81,8 +94,7 @@
       when: image_exists
 
     # =========================================================================
-    # FILE TRANSFER — IOS-XE
-    # Pushes directly to flash: on the device
+    # FILE TRANSFER — IOS-XE (direct SCP push via net_put)
     # =========================================================================
 
     - name: Push firmware image to device flash (IOS-XE)
@@ -95,50 +107,56 @@
         ansible_command_timeout: 2700
 
     # =========================================================================
-    # FILE TRANSFER — CBS
-    # CBS uses a two-slot system: active and inactive image.
-    # New firmware must be uploaded to the inactive slot path.
-    # We read the inactive path from 'show bootvar' so we always
-    # overwrite the correct slot regardless of the filename.
+    # FILE TRANSFER — CBS (switch pulls from TFTP server on control node)
+    #
+    # upgrade_tool.py starts a temporary TFTP server and passes:
+    #   tftp_server_ip   — IP of this machine reachable by the switch
+    #   tftp_server_port — port (69 normally, 6969 if not running as root)
+    #   tftp_filename    — firmware .bin filename
+    #
+    # The switch overwrites its inactive slot (image1.bin) with the new image.
+    # Standard TFTP uses port 69 — if tftp_server_port is 69 we use the
+    # standard tftp:// URL, otherwise we cannot specify a port in the IOS
+    # copy command so the operator must ensure port 69 is used (run with sudo).
     # =========================================================================
 
-    - name: Get inactive image slot path from bootvar (CBS)
+    - name: Show firmware download command (CBS)
+      ansible.builtin.debug:
+        msg: >
+          {{ inventory_hostname }}: running
+          boot system tftp://{{ tftp_server_ip }}/{{ tftp_filename }}
+      when: platform == 'cbs' and not image_exists
+
+    # CBS 'boot system tftp://' downloads the firmware AND sets it as
+    # the active image in one step. No prompt is shown — it just runs.
+    # The switch only needs a reload after this to boot the new image.
+    # Output includes '%COPY-N-ACTIVE' and 'copy operation was completed
+    # successfully' when done.
+    - name: Download and activate firmware via TFTP (CBS)
       cisco.ios.ios_command:
         commands:
-          - show bootvar
-      register: bootvar_output
-      when: platform == 'cbs' and not image_exists
-
-    - name: Parse inactive image path from bootvar (CBS)
-      ansible.builtin.set_fact:
-        cbs_inactive_path: >-
-          {% set found = namespace(path='flash://system/images/image1.bin') %}
-          {% for line in bootvar_output.stdout[0].splitlines() %}
-            {% if 'Inactive-image:' in line %}
-              {% set found.path = line.split('Inactive-image:')[-1].strip() %}
-            {% endif %}
-          {% endfor %}
-          {{ found.path }}
-      when: platform == 'cbs' and not image_exists
-
-    - name: Show inactive slot path that will be used (CBS)
-      ansible.builtin.debug:
-        msg: "{{ inventory_hostname }}: uploading to inactive slot {{ cbs_inactive_path }}"
-      when: platform == 'cbs' and not image_exists
-
-    - name: Push firmware image to inactive slot (CBS)
-      ansible.netcommon.net_put:
-        src:      "{{ firmware_local_bin_path }}"
-        dest:     "{{ cbs_inactive_path }}"
-        protocol: scp
+          - "boot system tftp://{{ tftp_server_ip }}/{{ tftp_filename }}"
+        wait_for:
+          - result[0] contains "completed successfully"
       when: platform == 'cbs' and not image_exists
       vars:
         ansible_command_timeout: 2700
+      register: tftp_result
+
+    - name: Show firmware download result (CBS)
+      ansible.builtin.debug:
+        msg: "{{ tftp_result.stdout[0] }}"
+      when: platform == 'cbs' and not image_exists and tftp_result is defined
+
+    - name: Confirm CBS image transfer complete
+      ansible.builtin.debug:
+        msg: >
+          {{ inventory_hostname }}: firmware transfer complete.
+          Run Phase 3 to activate and reboot.
+      when: platform == 'cbs' and not image_exists
 
     # =========================================================================
     # MD5 VERIFICATION — IOS-XE only
-    # CBS does not support 'verify /md5' — transfer success is confirmed
-    # by the net_put task completing without error
     # =========================================================================
 
     - name: Verify MD5 of image on flash (IOS-XE)
@@ -161,15 +179,8 @@
         success_msg: "MD5 verified on {{ inventory_hostname }}."
       when: platform == 'iosxe'
 
-    - name: Confirm CBS image staged successfully
-      ansible.builtin.debug:
-        msg: >
-          {{ inventory_hostname }}: firmware uploaded to inactive slot {{ cbs_inactive_path }}.
-          Run Phase 3 to activate and reboot.
-      when: platform == 'cbs' and not image_exists
-
     # =========================================================================
-    # STATUS FILE — read by upgrade_tool.py for the summary table
+    # STATUS FILE
     # =========================================================================
 
     - name: Write status — image staged, reboot required

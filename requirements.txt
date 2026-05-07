@@ -1,0 +1,5 @@
+# Python dependencies for upgrade_tool.py
+# Install with: pip install -r requirements.txt
+
+tftpy       # Temporary TFTP server for CBS firmware transfer
+ansible     # Ansible automation engine

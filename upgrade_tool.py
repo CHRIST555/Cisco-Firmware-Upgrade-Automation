@@ -29,6 +29,8 @@ import re
 from pathlib import Path
 from getpass import getpass
 import tempfile
+import threading
+import socket as _socket
 
 # ── Terminal colour helpers ──────────────────────────────────────────────────
 
@@ -417,11 +419,26 @@ def write_dynamic_inventory(devices, username, key_path):
 
 # ── Run options ──────────────────────────────────────────────────────────────
 
-def collect_run_options():
+def collect_run_options(phase_idx):
     section("Run Options")
     check   = prompt("Dry run? (--check, no changes applied) (y/n)", default="n")
     verbose = prompt("Verbose output? (-v) (y/n)", default="n")
-    return check.lower() == "y", verbose.lower() == "y"
+
+    # Only ask about reload if the selected phase includes Phase 3
+    _, _, tags = PHASES[phase_idx]
+    includes_reload = tags is None or "reload" in (tags or "") or "upgrade" in (tags or "")
+    send_reload = True
+    if includes_reload:
+        print()
+        info("Phase 3 will reload devices to apply the new firmware.")
+        warn("Only proceed with reload during a scheduled maintenance window.")
+        reload_ans = prompt("Send reload command to devices? (y/n)", default="y")
+        send_reload = reload_ans.lower() == "y"
+        if not send_reload:
+            info("Reload skipped — firmware will be staged but devices will NOT reboot.")
+            info("Run Phase 3 separately when ready to apply the upgrade.")
+
+    return check.lower() == "y", verbose.lower() == "y", send_reload
 
 # ── Directory scaffolding ────────────────────────────────────────────────────
 
@@ -450,7 +467,8 @@ def ensure_directories():
 # ── Build ansible-playbook command ───────────────────────────────────────────
 
 def build_command(phase_idx, inventory, username, key_path,
-                  check, verbose, firmware_path, target_version, target_md5):
+                  check, verbose, firmware_path, target_version, target_md5,
+                  send_reload=True):
     _, playbook, tags = PHASES[phase_idx]
 
     cmd = ["ansible-playbook", playbook, "-i", inventory, "-u", username]
@@ -471,12 +489,13 @@ def build_command(phase_idx, inventory, username, key_path,
     cmd += ["-e", f"firmware_target_image={firmware_filename}"]
     cmd += ["-e", f"firmware_target_version={target_version}"]
     cmd += ["-e", f"firmware_target_md5={target_md5}"]
+    cmd += ["-e", f"cbs_send_reload={'true' if send_reload else 'false'}"]
 
     return cmd
 
 # ── Summary screen ───────────────────────────────────────────────────────────
 
-def show_summary(phase_idx, username, key_path, firmware_path, target_version, target_md5, devices, check, verbose, cmd):
+def show_summary(phase_idx, username, key_path, firmware_path, target_version, target_md5, devices, check, verbose, send_reload, cmd):
     section("Summary — Review Before Running")
     phase_label = PHASES[phase_idx][0]
     print(f"  {c('Phase    :', CYAN)}  {phase_label}")
@@ -487,6 +506,7 @@ def show_summary(phase_idx, username, key_path, firmware_path, target_version, t
     print(f"  {c('MD5      :', CYAN)}  {target_md5[:8]}...{target_md5[-4:]}")
     print(f"  {c('Dry run  :', CYAN)}  {'yes (--check)' if check else 'no'}")
     print(f"  {c('Verbose  :', CYAN)}  {'yes' if verbose else 'no'}")
+    print(f"  {c('Reload   :', CYAN)}  {c('YES — devices will reboot', YELLOW) if send_reload else c('NO — staging only', GREEN)}")
     print()
     print(f"  {c('Target devices:', CYAN)}")
     print(f"  {'#':<4} {'Alias':<25} {'IP Address'}")
@@ -515,6 +535,79 @@ def show_summary(phase_idx, username, key_path, firmware_path, target_version, t
                             initial_indent="    ", subsequent_indent="      ")
     print(c(wrapped, BOLD))
     print()
+
+# ── TFTP server ──────────────────────────────────────────────────────────────
+
+def get_local_ip():
+    """Get the IP address of this machine that is most likely reachable by devices."""
+    try:
+        # Connect to a public address to determine the outbound interface IP
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "0.0.0.0"
+
+def start_tftp_server(firmware_path):
+    """
+    Start a temporary TFTP server serving the firmware file.
+    Returns (server, thread, tftp_root, server_ip, filename).
+    The caller must call server.stop() when done.
+    """
+    try:
+        import tftpy
+    except ImportError:
+        return None, None, None, None, None
+
+    import shutil
+
+    tftp_root = tempfile.mkdtemp(prefix="tftp_root_")
+    filename  = Path(firmware_path).name
+
+    # Copy firmware file into tftp root
+    shutil.copy2(firmware_path, os.path.join(tftp_root, filename))
+
+    server    = tftpy.TftpServer(tftp_root)
+    server_ip = get_local_ip()
+
+    t = threading.Thread(
+        target=server.listen,
+        kwargs={"listenip": "0.0.0.0", "listenport": 69},
+        daemon=True
+    )
+
+    try:
+        t.start()
+        import time; time.sleep(0.5)
+        if not server.is_running.is_set():
+            raise RuntimeError("TFTP server failed to start")
+        return server, t, tftp_root, server_ip, filename
+    except PermissionError:
+        # Port 69 requires root — try port 6969 as fallback
+        server2   = tftpy.TftpServer(tftp_root)
+        t2 = threading.Thread(
+            target=server2.listen,
+            kwargs={"listenip": "0.0.0.0", "listenport": 6969},
+            daemon=True
+        )
+        t2.start()
+        import time; time.sleep(0.5)
+        return server2, t2, tftp_root, server_ip, filename
+
+def stop_tftp_server(server, tftp_root):
+    """Stop the TFTP server and clean up temp directory."""
+    import shutil, time
+    if server:
+        try:
+            server.stop()
+            time.sleep(0.3)
+        except Exception:
+            pass
+    if tftp_root and os.path.exists(tftp_root):
+        shutil.rmtree(tftp_root, ignore_errors=True)
+
 
 # ── Post-run summary ─────────────────────────────────────────────────────────
 
@@ -653,17 +746,18 @@ def main():
     devices     = collect_device_ips()
     dynamic_inv = write_dynamic_inventory(devices, username, key_path)
 
-    # 5. Run options
-    check, verbose = collect_run_options()
+    # 5. Run options (includes reload prompt for phases that reboot)
+    check, verbose, send_reload = collect_run_options(phase_idx)
 
     # 6. Build command
     cmd = build_command(phase_idx, dynamic_inv, username, key_path,
-                        check, verbose, firmware_path, target_version, target_md5)
+                        check, verbose, firmware_path, target_version, target_md5,
+                        send_reload)
 
     # 7. Summary + confirm
     banner()
     show_summary(phase_idx, username, key_path, firmware_path,
-                 target_version, target_md5, devices, check, verbose, cmd)
+                 target_version, target_md5, devices, check, verbose, send_reload, cmd)
 
     go = prompt("Proceed? (y/n)", default="y")
     if go.lower() != "y":
@@ -674,7 +768,33 @@ def main():
     # 8. Create output directories
     ensure_directories()
 
-    # 9. Run Ansible
+    # 9. Start TFTP server so CBS switches can pull the firmware file
+    tftp_server, tftp_thread, tftp_root, server_ip, tftp_filename = \
+        start_tftp_server(firmware_path)
+
+    tftp_port = 69
+    if tftp_server:
+        # Detect which port was used
+        try:
+            tftp_port = tftp_server.sock.getsockname()[1] if tftp_server.sock else 69
+        except Exception:
+            tftp_port = 69
+        section("TFTP Server")
+        success(f"TFTP server started on {server_ip}:{tftp_port}")
+        info(f"Serving: {tftp_filename}")
+        info("CBS switches will pull the firmware from this server.")
+        if tftp_port != 69:
+            warn("Running on port 6969 (port 69 requires root/sudo).")
+            warn("Ensure your CBS switch can reach this port or run with sudo.")
+        # Pass TFTP details to Ansible as extra vars
+        cmd += ["-e", f"tftp_server_ip={server_ip}"]
+        cmd += ["-e", f"tftp_server_port={tftp_port}"]
+        cmd += ["-e", f"tftp_filename={tftp_filename}"]
+    else:
+        warn("tftpy not installed — CBS file transfer will be skipped.")
+        info("Install with: pip install tftpy")
+
+    # 10. Run Ansible
     section("Running Ansible")
     print()
     try:
@@ -691,6 +811,7 @@ def main():
     finally:
         if os.path.exists(dynamic_inv):
             os.unlink(dynamic_inv)
+        stop_tftp_server(tftp_server, tftp_root)
 
     # Print summary table regardless of whether Ansible succeeded or failed
     print_summary(devices, phase_idx)

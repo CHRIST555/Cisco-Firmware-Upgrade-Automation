@@ -79,50 +79,56 @@
 
     # =========================================================================
     # SET BOOT IMAGE — CBS
-    # 'boot system inactive-image' swaps the active and inactive image slots.
-    # The new firmware must already be in the inactive slot (Phase 2).
+    # 'boot system tftp://' in Phase 2 already set the new image as active.
+    # We just need to confirm the target image is active before reloading.
     # =========================================================================
 
-    - name: Confirm target image is in bootvar before swapping (CBS)
-      cisco.ios.ios_command:
-        commands:
-          - show bootvar
-      register: cbs_bootvar
-      when: platform == 'cbs'
-
-    - name: Assert target image is present in bootvar (CBS)
-      ansible.builtin.assert:
-        that:
-          - firmware_target_image | default(firmware.target_image)
-            in cbs_bootvar.stdout[0]
-        fail_msg: >
-          Target image {{ firmware_target_image | default(firmware.target_image) }}
-          not found in show bootvar on {{ inventory_hostname }}.
-          Run Phase 2 (stage firmware) before attempting upgrade.
-        success_msg: "Target image confirmed in bootvar — ready to swap."
-      when: platform == 'cbs'
-
-    - name: Swap inactive image to active (CBS)
-      cisco.ios.ios_command:
-        commands:
-          - boot system inactive-image
-      when: platform == 'cbs'
-
-    - name: Confirm boot swap accepted (CBS)
+    # CBS: 'boot system tftp://' already staged the image in Phase 2.
+    # The image takes effect after reload — no boot variable check needed.
+    - name: Confirm ready to reload (CBS)
       ansible.builtin.debug:
         msg: >
-          {{ inventory_hostname }}: 'boot system inactive-image' accepted.
-          Device will boot new firmware after reload.
+          {{ inventory_hostname }}: firmware staged and ready.
+          Reloading now to apply {{ firmware_target_image | default(firmware.target_image) }}.
       when: platform == 'cbs'
 
     # =========================================================================
     # SAVE CONFIG AND RELOAD
     # =========================================================================
 
+    # =========================================================================
+    # SAVE AND RELOAD
+    # cbs_send_reload is passed from upgrade_tool.py — defaults to true.
+    # If the user chose not to reload, we save config and stop here.
+    # =========================================================================
+
     - name: Save running configuration before reload
       cisco.ios.ios_command:
         commands:
-          - write memory
+          - command: write memory
+            prompt:
+              - "Overwrite"
+              - "confirm"
+              - "y/n"
+              - "Y/N"
+            answer:
+              - "y"
+              - "y"
+              - "y"
+              - "y"
+      vars:
+        ansible_command_timeout: 300
+
+    - name: Inform operator — reload skipped by user request
+      ansible.builtin.debug:
+        msg: >
+          {{ inventory_hostname }}: config saved. Reload was skipped.
+          Run Phase 3 during your maintenance window to reboot and apply the firmware.
+      when: not (cbs_send_reload | default('true') | bool)
+
+    - name: Skip remaining tasks if reload not requested
+      ansible.builtin.meta: end_host
+      when: not (cbs_send_reload | default('true') | bool)
 
     - name: Reload device (IOS-XE)
       cisco.ios.ios_command:
@@ -135,7 +141,7 @@
               - "y"
               - "y"
       vars:
-        ansible_command_timeout: 30
+        ansible_command_timeout: 300
       ignore_errors: true
       when: platform == 'iosxe'
 
@@ -145,10 +151,16 @@
           - command: reload
             prompt:
               - "proceed"
+              - "continue"
+              - "Y/N"
+              - "y/n"
             answer:
               - "y"
+              - "y"
+              - "y"
+              - "y"
       vars:
-        ansible_command_timeout: 30
+        ansible_command_timeout: 45
       ignore_errors: true
       when: platform == 'cbs'
 
