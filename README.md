@@ -160,7 +160,7 @@ The `.md5` file is on the same Cisco download page as the `.bin`. The launcher r
 **4. Run the launcher**
 
 ```bash
-sudo python upgrade_tool.py
+sudo python3 upgrade_tool.py
 ```
 
 > `sudo` is required on Linux/Mac so the TFTP server can bind to port 69. If you are only upgrading IOS-XE devices, `sudo` is not needed.
@@ -169,7 +169,7 @@ sudo python upgrade_tool.py
 
 ## Using the Launcher
 
-Run `sudo python upgrade_tool.py` and follow the prompts.
+Run `sudo python3 upgrade_tool.py` and follow the prompts.
 
 ### Step 1 — Firmware image
 
@@ -238,7 +238,7 @@ For CBS devices, the launcher starts a temporary TFTP server automatically:
 
 ```
   ┌─ TFTP Server ─────────────────────────────────────────────
-  ✔  TFTP server started on 192.168.26.110:69
+  ✔  TFTP server started on 192.xxx.xx.xxx:69
   ℹ  Serving: image_cbs_ros_3.5.3.3_release_cisco_signed.bin
   ℹ  CBS switches will pull the firmware from this server.
 ```
